@@ -1,0 +1,30 @@
+name: slrv-rust-ci
+
+on:
+  pull_request:
+    branches:
+      - slrv
+  push:
+    branches:
+      - "release/*"
+      - "release/**"
+  workflow_dispatch:
+
+jobs:
+  rust-ci:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: cargo clippy
+        run: cargo clippy --all-features --tests -- -D warnings
+      - name: cargo test
+        run: cargo test --all-features
