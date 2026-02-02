@@ -244,6 +244,26 @@ pub struct CodexSpawnOk {
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
 static CHAT_WIRE_API_DEPRECATION_EMITTED: AtomicBool = AtomicBool::new(false);
+const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
+const SLRV_PROMPT: &str = include_str!("../SLRV.md");
+
+fn append_slrv_if_enabled(base_instructions: String, slrv_enabled: bool) -> String {
+    if !slrv_enabled || base_instructions.contains(SLRV_HEADER) {
+        return base_instructions;
+    }
+
+    let mut combined = base_instructions.trim_end().to_string();
+    combined.push_str("\n\n");
+    combined.push_str(SLRV_PROMPT.trim());
+    combined
+}
+
+fn strip_slrv_suffix(instructions: &str) -> &str {
+    instructions
+        .split_once(SLRV_HEADER)
+        .map(|(before, _)| before.trim_end())
+        .unwrap_or(instructions)
+}
 
 fn maybe_push_chat_wire_api_deprecation(
     config: &Config,
@@ -327,12 +347,14 @@ impl Codex {
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
         // 3. base_intructions for current model
+        // 4. append SLRV if enabled (and not already present)
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
         let base_instructions = config
             .base_instructions
             .clone()
             .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        let base_instructions = append_slrv_if_enabled(base_instructions, config.slrv_enabled);
         // Respect explicit thread-start tools; fall back to persisted tools when resuming a thread.
         let dynamic_tools = if dynamic_tools.is_empty() {
             conversation_history.get_dynamic_tools().unwrap_or_default()
@@ -1906,8 +1928,10 @@ impl Session {
             && let Some(personality) = turn_context.personality
         {
             let model_info = turn_context.client.get_model_info();
+            let base_instructions_for_personality = strip_slrv_suffix(&base_instructions);
+            let model_instructions = model_info.get_model_instructions(Some(personality));
             let has_baked_personality = model_info.supports_personality()
-                && base_instructions == model_info.get_model_instructions(Some(personality));
+                && base_instructions_for_personality.trim_end() == model_instructions.trim_end();
             if !has_baked_personality
                 && let Some(personality_message) =
                     Self::personality_message_for(&model_info, personality)
@@ -4629,14 +4653,15 @@ mod tests {
                 );
             }
 
+            let expected =
+                append_slrv_if_enabled(model_info.base_instructions.clone(), config.slrv_enabled);
             {
                 let mut state = session.state.lock().await;
-                state.session_configuration.base_instructions =
-                    model_info.base_instructions.clone();
+                state.session_configuration.base_instructions = expected.clone();
             }
 
             let base_instructions = session.get_base_instructions().await;
-            assert_eq!(base_instructions.text, model_info.base_instructions);
+            assert_eq!(base_instructions.text, expected);
         }
     }
 
@@ -4976,10 +5001,13 @@ mod tests {
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
-            base_instructions: config
-                .base_instructions
-                .clone()
-                .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            base_instructions: append_slrv_if_enabled(
+                config
+                    .base_instructions
+                    .clone()
+                    .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+                config.slrv_enabled,
+            ),
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.approval_policy.clone(),
             sandbox_policy: config.sandbox_policy.clone(),
@@ -5059,10 +5087,13 @@ mod tests {
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
-            base_instructions: config
-                .base_instructions
-                .clone()
-                .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            base_instructions: append_slrv_if_enabled(
+                config
+                    .base_instructions
+                    .clone()
+                    .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+                config.slrv_enabled,
+            ),
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.approval_policy.clone(),
             sandbox_policy: config.sandbox_policy.clone(),
@@ -5326,10 +5357,13 @@ mod tests {
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
-            base_instructions: config
-                .base_instructions
-                .clone()
-                .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            base_instructions: append_slrv_if_enabled(
+                config
+                    .base_instructions
+                    .clone()
+                    .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+                config.slrv_enabled,
+            ),
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.approval_policy.clone(),
             sandbox_policy: config.sandbox_policy.clone(),
@@ -5446,10 +5480,13 @@ mod tests {
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
-            base_instructions: config
-                .base_instructions
-                .clone()
-                .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            base_instructions: append_slrv_if_enabled(
+                config
+                    .base_instructions
+                    .clone()
+                    .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+                config.slrv_enabled,
+            ),
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.approval_policy.clone(),
             sandbox_policy: config.sandbox_policy.clone(),

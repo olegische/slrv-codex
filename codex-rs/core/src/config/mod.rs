@@ -171,6 +171,9 @@ pub struct Config {
     /// Base instructions override.
     pub base_instructions: Option<String>,
 
+    /// Append the SLRV framework to base instructions.
+    pub slrv_enabled: bool,
+
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
 
@@ -822,6 +825,9 @@ pub struct ConfigToml {
     /// Developer instructions inserted as a `developer` role message.
     #[serde(default)]
     pub developer_instructions: Option<String>,
+
+    /// Append the SLRV framework to base instructions. Defaults to `true`.
+    pub slrv_enabled: Option<bool>,
 
     /// Optional path to a file containing model instructions that will override
     /// the built-in instructions for the selected model. Users are STRONGLY
@@ -1495,6 +1501,7 @@ impl Config {
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
+        let slrv_enabled = cfg.slrv_enabled.unwrap_or(true);
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let personality = personality
             .or(config_profile.personality)
@@ -1556,6 +1563,7 @@ impl Config {
             notify: cfg.notify,
             user_instructions,
             base_instructions,
+            slrv_enabled,
             personality,
             developer_instructions,
             compact_prompt,
@@ -3814,6 +3822,7 @@ model_verbosity = "high"
                 personality: Some(Personality::Friendly),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
+                slrv_enabled: true,
                 developer_instructions: None,
                 compact_prompt: None,
                 forced_chatgpt_workspace_id: None,
@@ -3899,6 +3908,7 @@ model_verbosity = "high"
             personality: Some(Personality::Friendly),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            slrv_enabled: true,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -3999,6 +4009,7 @@ model_verbosity = "high"
             personality: Some(Personality::Friendly),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            slrv_enabled: true,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4085,6 +4096,7 @@ model_verbosity = "high"
             personality: Some(Personality::Friendly),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            slrv_enabled: true,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,

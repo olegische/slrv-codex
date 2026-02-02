@@ -1528,6 +1528,10 @@
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
     },
+    "slrv_enabled": {
+      "description": "Append the SLRV framework to base instructions. Defaults to `true`.",
+      "type": "boolean"
+    },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
       "type": "boolean"
