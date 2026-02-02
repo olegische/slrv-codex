@@ -73,10 +73,32 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
+
+// NOTE: These assertions validate upstream Codex base instructions. When SLRV is enabled,
+// base instructions are intentionally extended with responsibility and refusal constraints.
+// Therefore, exact snapshot equality is only valid when slrv_enabled = false.
+fn assert_instructions_match(instructions: &str, expected: &str, slrv_enabled: bool) {
+    let normalized_instructions = normalize_newlines(instructions);
+    let normalized_expected = normalize_newlines(expected);
+    if slrv_enabled {
+        assert!(
+            normalized_instructions.starts_with(&normalized_expected),
+            "expected instructions to start with base instructions; got: {normalized_instructions}"
+        );
+        assert!(
+            normalized_instructions.contains(SLRV_HEADER),
+            "expected SLRV header to be present; got: {normalized_instructions}"
+        );
+    } else {
+        assert_eq!(normalized_instructions, normalized_expected);
+    }
+}
+
+async fn prompt_tools_are_consistent_across_requests_impl(
+    slrv_enabled: bool,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
@@ -88,9 +110,10 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         thread_manager,
         ..
     } = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             config.user_instructions = Some("be consistent and helpful".to_string());
             config.model = Some("gpt-5.1-codex-max".to_string());
+            config.slrv_enabled = slrv_enabled;
             // Keep tool expectations stable when the default web_search mode changes.
             config.web_search_mode = Some(WebSearchMode::Cached);
             config.features.enable(Feature::CollaborationModes);
@@ -142,45 +165,53 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "web_search",
         "view_image",
     ];
-    let body0 = req1.single_request().body_json();
-
     let expected_instructions = if expected_tools_names.contains(&"apply_patch") {
         base_instructions
     } else {
         [base_instructions, APPLY_PATCH_TOOL_INSTRUCTIONS.to_string()].join("\n")
     };
 
-    assert_eq!(
-        body0["instructions"],
-        serde_json::json!(expected_instructions),
-    );
+    let body0 = req1.single_request().body_json();
+    let instructions0 = body0["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
+    assert_instructions_match(instructions0, &expected_instructions, slrv_enabled);
     assert_tool_names(&body0, &expected_tools_names);
 
     let body1 = req2.single_request().body_json();
-    assert_eq!(
-        body1["instructions"],
-        serde_json::json!(expected_instructions),
-    );
+    let instructions1 = body1["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
+    assert_instructions_match(instructions1, &expected_instructions, slrv_enabled);
     assert_tool_names(&body1, &expected_tools_names);
 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+    prompt_tools_are_consistent_across_requests_impl(false).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_mini_latest_tools() -> anyhow::Result<()> {
+async fn prompt_tools_are_consistent_across_requests_slrv_enabled() -> anyhow::Result<()> {
+    prompt_tools_are_consistent_across_requests_impl(true).await
+}
+
+async fn codex_mini_latest_tools_impl(slrv_enabled: bool) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
     let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             config.user_instructions = Some("be consistent and helpful".to_string());
             config.features.disable(Feature::ApplyPatchFreeform);
             config.features.enable(Feature::CollaborationModes);
             config.model = Some("codex-mini-latest".to_string());
+            config.slrv_enabled = slrv_enabled;
         })
         .build(&server)
         .await?;
@@ -214,21 +245,25 @@ async fn codex_mini_latest_tools() -> anyhow::Result<()> {
     let instructions0 = body0["instructions"]
         .as_str()
         .expect("instructions should be a string");
-    assert_eq!(
-        normalize_newlines(instructions0),
-        normalize_newlines(&expected_instructions)
-    );
+    assert_instructions_match(instructions0, &expected_instructions, slrv_enabled);
 
     let body1 = req2.single_request().body_json();
     let instructions1 = body1["instructions"]
         .as_str()
         .expect("instructions should be a string");
-    assert_eq!(
-        normalize_newlines(instructions1),
-        normalize_newlines(&expected_instructions)
-    );
+    assert_instructions_match(instructions1, &expected_instructions, slrv_enabled);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_mini_latest_tools() -> anyhow::Result<()> {
+    codex_mini_latest_tools_impl(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_mini_latest_tools_slrv_enabled() -> anyhow::Result<()> {
+    codex_mini_latest_tools_impl(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

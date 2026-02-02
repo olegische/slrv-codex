@@ -53,6 +53,27 @@ use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
 
 const REMOTE_MODEL_SLUG: &str = "codex-test";
+const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
+
+// NOTE: These assertions validate upstream Codex base instructions. When SLRV is enabled,
+// base instructions are intentionally extended with responsibility and refusal constraints.
+// Therefore, exact snapshot equality is only valid when slrv_enabled = false.
+fn assert_instructions_match(instructions: &str, expected: &str, slrv_enabled: bool) {
+    let normalized_instructions = instructions.replace("\r\n", "\n");
+    let normalized_expected = expected.replace("\r\n", "\n");
+    if slrv_enabled {
+        assert!(
+            normalized_instructions.starts_with(&normalized_expected),
+            "expected instructions to start with base instructions; got: {normalized_instructions}"
+        );
+        assert!(
+            normalized_instructions.contains(SLRV_HEADER),
+            "expected SLRV header to be present; got: {normalized_instructions}"
+        );
+    } else {
+        assert_eq!(normalized_instructions, normalized_expected);
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
@@ -102,7 +123,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
 
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
+        .with_config(move |config| {
             config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
         });
@@ -288,8 +309,7 @@ async fn remote_models_truncation_policy_with_tool_output_override() -> Result<(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_models_apply_remote_base_instructions() -> Result<()> {
+async fn remote_models_apply_remote_base_instructions_impl(slrv_enabled: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -348,9 +368,10 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
 
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
+        .with_config(move |config| {
             config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
+            config.slrv_enabled = slrv_enabled;
         });
     let TestCodex {
         codex,
@@ -400,9 +421,23 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
     let base_model_info = models_manager.get_model_info("gpt-5.1", &config).await;
     let body = response_mock.single_request().body_json();
     let instructions = body["instructions"].as_str().unwrap();
-    assert_eq!(instructions, base_model_info.base_instructions);
+    assert_instructions_match(
+        instructions,
+        &base_model_info.base_instructions,
+        slrv_enabled,
+    );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_models_apply_remote_base_instructions() -> Result<()> {
+    remote_models_apply_remote_base_instructions_impl(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_models_apply_remote_base_instructions_slrv_enabled() -> Result<()> {
+    remote_models_apply_remote_base_instructions_impl(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

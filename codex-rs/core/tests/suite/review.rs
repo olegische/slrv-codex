@@ -31,6 +31,28 @@ use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
 
+const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
+
+// NOTE: These assertions validate upstream Codex base instructions. When SLRV is enabled,
+// base instructions are intentionally extended with responsibility and refusal constraints.
+// Therefore, exact snapshot equality is only valid when slrv_enabled = false.
+fn assert_instructions_match(instructions: &str, expected: &str, slrv_enabled: bool) {
+    let normalized_instructions = instructions.replace("\r\n", "\n");
+    let normalized_expected = expected.replace("\r\n", "\n");
+    if slrv_enabled {
+        assert!(
+            normalized_instructions.starts_with(&normalized_expected),
+            "expected instructions to start with base instructions; got: {normalized_instructions}"
+        );
+        assert!(
+            normalized_instructions.contains(SLRV_HEADER),
+            "expected SLRV header to be present; got: {normalized_instructions}"
+        );
+    } else {
+        assert_eq!(normalized_instructions, normalized_expected);
+    }
+}
+
 /// Verify that submitting `Op::Review` spawns a child task and emits
 /// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
 /// in that order when the model returns a structured review JSON payload.
@@ -490,6 +512,17 @@ async fn review_uses_session_model_when_review_model_unset() {
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn review_input_isolated_from_parent_history() {
+    review_input_isolated_from_parent_history_impl(false).await;
+}
+
+// Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn review_input_isolated_from_parent_history_slrv_enabled() {
+    review_input_isolated_from_parent_history_impl(true).await;
+}
+
+async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
     skip_if_no_network!();
 
     // Mock server for the single review request
@@ -560,9 +593,15 @@ async fn review_input_isolated_from_parent_history() {
             .await
             .unwrap();
     }
-    let codex =
-        resume_conversation_for_server(&server, codex_home.clone(), session_file.clone(), |_| {})
-            .await;
+    let codex = resume_conversation_for_server(
+        &server,
+        codex_home.clone(),
+        session_file.clone(),
+        move |config| {
+            config.slrv_enabled = slrv_enabled;
+        },
+    )
+    .await;
 
     // Submit review request; it must start fresh (no parent history in `input`).
     let review_prompt = "Please review only this".to_string();
@@ -622,7 +661,7 @@ async fn review_input_isolated_from_parent_history() {
 
     // Ensure the REVIEW_PROMPT rubric is sent via instructions.
     let instructions = body["instructions"].as_str().expect("instructions string");
-    assert_eq!(instructions, REVIEW_PROMPT);
+    assert_instructions_match(instructions, REVIEW_PROMPT, slrv_enabled);
 
     // Also verify that a user interruption note was recorded in the rollout.
     let path = codex.rollout_path().expect("rollout path");
