@@ -1,34 +1,33 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
+<p align="center"><strong>SLRV Codex CLI</strong> is a research fork of the OpenAI Codex CLI with the <a href="https://slrv.md/">SLRV framework</a> injected at the agent level.</p>
+<p align="center"><em>Research tool only. Not a production product and not an official OpenAI release.</em></p>
 <p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  <img src=".github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
 </p>
 </br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
+If you want the <em>official</em> Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
 </br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 
 ---
 
 ## Quickstart
 
-### Installing and running Codex CLI
+### Installing and running SLRV Codex CLI
 
-Install globally with your preferred package manager:
-
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+Install from the GitHub Releases in this repository:
 
 ```shell
-# Install using Homebrew
-brew install --cask codex
+# 1) Download the release asset for your platform from:
+#    https://github.com/olegische/slrv-codex/releases/latest
+# 2) Extract, then rename to avoid clobbering the upstream codex binary.
+tar -xzf codex-<target>.tar.gz
+mv codex-<target> slrv-codex
+chmod +x slrv-codex
 ```
 
-Then simply run `codex` to get started.
+Then run `slrv-codex` to get started.
 
 <details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+<summary>Release asset names and platform mapping.</summary>
 
 Each GitHub Release contains many executables, but in practice, you likely want one of these:
 
@@ -39,7 +38,7 @@ Each GitHub Release contains many executables, but in practice, you likely want 
   - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
   - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`). Since we did not rename the application, we recommend renaming the extracted file to `slrv-codex` to avoid clobbering the official `codex` binary.
 
 </details>
 
@@ -51,6 +50,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 
 ## Docs
 
+- [**SLRV framework**](https://slrv.md/)
 - [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
