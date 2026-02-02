@@ -33,6 +33,20 @@ use wiremock::MockServer;
 
 const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
 
+fn require_some<T>(value: Option<T>, message: &str) -> T {
+    match value {
+        Some(value) => value,
+        None => panic!("{message}"),
+    }
+}
+
+fn require_ok<T, E: std::fmt::Display>(value: Result<T, E>, message: &str) -> T {
+    match value {
+        Ok(value) => value,
+        Err(err) => panic!("{message}: {err}"),
+    }
+}
+
 // NOTE: These assertions validate upstream Codex base instructions. When SLRV is enabled,
 // base instructions are intentionally extended with responsibility and refusal constraints.
 // Therefore, exact snapshot equality is only valid when slrv_enabled = false.
@@ -88,32 +102,36 @@ async fn review_op_emits_lifecycle_and_review_output() {
             }},
             {"type":"response.completed", "response": {"id": "__ID__"}}
         ]"#;
-    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let review_json_escaped =
+        require_ok(serde_json::to_string(&review_json), "serialize review json");
     let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
     let (server, _request_log) = start_responses_server_with_sse(&sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
     // Submit review request.
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "Please review my changes".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "Please review my changes".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     // Verify lifecycle: Entered -> Exited(Some(review)) -> TurnComplete.
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {
-        EventMsg::ExitedReviewMode(ev) => ev
-            .review_output
-            .expect("expected ExitedReviewMode with Some(review_output)"),
+        EventMsg::ExitedReviewMode(ev) => require_some(
+            ev.review_output,
+            "expected ExitedReviewMode with Some(review_output)",
+        ),
         other => panic!("expected ExitedReviewMode(..), got {other:?}"),
     };
 
@@ -138,8 +156,8 @@ async fn review_op_emits_lifecycle_and_review_output() {
 
     // Also verify that a user message with the header and a formatted finding
     // was recorded back in the parent session's rollout.
-    let path = codex.rollout_path().expect("rollout path");
-    let text = std::fs::read_to_string(&path).expect("read rollout file");
+    let path = require_some(codex.rollout_path(), "rollout path");
+    let text = require_ok(std::fs::read_to_string(&path), "read rollout file");
 
     let mut saw_header = false;
     let mut saw_finding_line = false;
@@ -150,8 +168,8 @@ async fn review_op_emits_lifecycle_and_review_output() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let v: serde_json::Value = require_ok(serde_json::from_str(line), "jsonl line");
+        let rl: RolloutLine = require_ok(serde_json::from_value(v), "rollout line");
         if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item {
             if role == "user" {
                 for c in content {
@@ -213,27 +231,30 @@ async fn review_op_with_plain_text_emits_review_fallback() {
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
     let (server, _request_log) = start_responses_server_with_sse(sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "Plain text review".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "Plain text review".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {
-        EventMsg::ExitedReviewMode(ev) => ev
-            .review_output
-            .expect("expected ExitedReviewMode with Some(review_output)"),
+        EventMsg::ExitedReviewMode(ev) => require_some(
+            ev.review_output,
+            "expected ExitedReviewMode with Some(review_output)",
+        ),
         other => panic!("expected ExitedReviewMode(..), got {other:?}"),
     };
 
@@ -274,20 +295,22 @@ async fn review_filters_agent_message_related_events() {
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
     let (server, _request_log) = start_responses_server_with_sse(sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "Filter streaming events".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "Filter streaming events".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     let mut saw_entered = false;
     let mut saw_exited = false;
@@ -353,23 +376,26 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
             }},
             {"type":"response.completed", "response": {"id": "__ID__"}}
         ]"#;
-    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let review_json_escaped =
+        require_ok(serde_json::to_string(&review_json), "serialize review json");
     let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
     let (server, _request_log) = start_responses_server_with_sse(&sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "check structured".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "check structured".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     // Drain events until TurnComplete; ensure we only see a final
     // AgentMessage (no streaming assistant messages).
@@ -411,7 +437,7 @@ async fn review_uses_custom_review_model_from_config() {
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     // Choose a review model different from the main model; ensure it is used.
     let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
         cfg.model = Some("gpt-4.1".to_string());
@@ -419,17 +445,19 @@ async fn review_uses_custom_review_model_from_config() {
     })
     .await;
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "use custom model".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "use custom model".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     // Wait for completion
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
@@ -448,7 +476,7 @@ async fn review_uses_custom_review_model_from_config() {
     let request = request_log.single_request();
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
-    assert_eq!(body["model"].as_str().unwrap(), "gpt-5.1");
+    assert_eq!(body["model"].as_str(), Some("gpt-5.1"));
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -465,24 +493,26 @@ async fn review_uses_session_model_when_review_model_unset() {
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
         cfg.model = Some("gpt-4.1".to_string());
         cfg.review_model = None;
     })
     .await;
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "use session model".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "use session model".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let _closed = wait_for_event(&codex, |ev| {
@@ -499,7 +529,7 @@ async fn review_uses_session_model_when_review_model_unset() {
     let request = request_log.single_request();
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
-    assert_eq!(body["model"].as_str().unwrap(), "gpt-4.1");
+    assert_eq!(body["model"].as_str(), Some("gpt-4.1"));
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -532,11 +562,14 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
 
     // Seed a parent session history via resume file with both user + assistant items.
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
 
     let session_file = codex_home.path().join("resume.jsonl");
     {
-        let mut f = tokio::fs::File::create(&session_file).await.unwrap();
+        let mut f = require_ok(
+            tokio::fs::File::create(&session_file).await,
+            "create resume file",
+        );
         let convo_id = Uuid::new_v4();
         // Proper session_meta line (enveloped) with a conversation id
         let meta_line = serde_json::json!({
@@ -551,9 +584,10 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
                 "model_provider": "test-provider"
             }
         });
-        f.write_all(format!("{meta_line}\n").as_bytes())
-            .await
-            .unwrap();
+        require_ok(
+            f.write_all(format!("{meta_line}\n").as_bytes()).await,
+            "write session meta",
+        );
 
         // Prior user message (enveloped response_item)
         let user = codex_protocol::models::ResponseItem::Message {
@@ -564,15 +598,16 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
             }],
             end_turn: None,
         };
-        let user_json = serde_json::to_value(&user).unwrap();
+        let user_json = require_ok(serde_json::to_value(&user), "serialize user response");
         let user_line = serde_json::json!({
             "timestamp": "2024-01-01T00:00:01.000Z",
             "type": "response_item",
             "payload": user_json
         });
-        f.write_all(format!("{user_line}\n").as_bytes())
-            .await
-            .unwrap();
+        require_ok(
+            f.write_all(format!("{user_line}\n").as_bytes()).await,
+            "write user response",
+        );
 
         // Prior assistant message (enveloped response_item)
         let assistant = codex_protocol::models::ResponseItem::Message {
@@ -583,15 +618,19 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
             }],
             end_turn: None,
         };
-        let assistant_json = serde_json::to_value(&assistant).unwrap();
+        let assistant_json = require_ok(
+            serde_json::to_value(&assistant),
+            "serialize assistant response",
+        );
         let assistant_line = serde_json::json!({
             "timestamp": "2024-01-01T00:00:02.000Z",
             "type": "response_item",
             "payload": assistant_json
         });
-        f.write_all(format!("{assistant_line}\n").as_bytes())
-            .await
-            .unwrap();
+        require_ok(
+            f.write_all(format!("{assistant_line}\n").as_bytes()).await,
+            "write assistant response",
+        );
     }
     let codex = resume_conversation_for_server(
         &server,
@@ -605,17 +644,19 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
 
     // Submit review request; it must start fresh (no parent history in `input`).
     let review_prompt = "Please review only this".to_string();
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: review_prompt.clone(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: review_prompt.clone(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let _closed = wait_for_event(&codex, |ev| {
@@ -633,46 +674,50 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
     let request = request_log.single_request();
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
-    let input = body["input"].as_array().expect("input array");
+    let input = require_some(body["input"].as_array(), "input array");
     assert!(
         input.len() >= 2,
         "expected at least environment context and review prompt"
     );
 
-    let env_text = input
-        .iter()
-        .filter_map(|msg| msg["content"][0]["text"].as_str())
-        .find(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
-        .expect("env text");
+    let env_text = require_some(
+        input
+            .iter()
+            .filter_map(|msg| msg["content"][0]["text"].as_str())
+            .find(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG)),
+        "env text",
+    );
     assert!(
         env_text.contains("<cwd>"),
         "environment context should include cwd"
     );
 
-    let review_text = input
-        .iter()
-        .filter_map(|msg| msg["content"][0]["text"].as_str())
-        .find(|text| *text == review_prompt)
-        .expect("review prompt text");
+    let review_text = require_some(
+        input
+            .iter()
+            .filter_map(|msg| msg["content"][0]["text"].as_str())
+            .find(|text| *text == review_prompt),
+        "review prompt text",
+    );
     assert_eq!(
         review_text, review_prompt,
         "user message should only contain the raw review prompt"
     );
 
     // Ensure the REVIEW_PROMPT rubric is sent via instructions.
-    let instructions = body["instructions"].as_str().expect("instructions string");
+    let instructions = require_some(body["instructions"].as_str(), "instructions string");
     assert_instructions_match(instructions, REVIEW_PROMPT, slrv_enabled);
 
     // Also verify that a user interruption note was recorded in the rollout.
-    let path = codex.rollout_path().expect("rollout path");
-    let text = std::fs::read_to_string(&path).expect("read rollout file");
+    let path = require_some(codex.rollout_path(), "rollout path");
+    let text = require_ok(std::fs::read_to_string(&path), "read rollout file");
     let mut saw_interruption_message = false;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let v: serde_json::Value = require_ok(serde_json::from_str(line), "jsonl line");
+        let rl: RolloutLine = require_ok(serde_json::from_value(v), "rollout line");
         if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item
             && role == "user"
         {
@@ -713,21 +758,23 @@ async fn review_history_surfaces_in_parent_session() {
         {"type":"response.completed", "response": {"id": "__ID__"}}
     ]"#;
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 2).await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
     // 1) Run a review turn that produces an assistant message (isolated in child).
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "Start a review".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "Start a review".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let _closed = wait_for_event(&codex, |ev| {
         matches!(
@@ -742,16 +789,18 @@ async fn review_history_surfaces_in_parent_session() {
 
     // 2) Continue in the parent session; request input must not include any review items.
     let followup = "back to parent".to_string();
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: followup.clone(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
-        .await
-        .unwrap();
+    require_ok(
+        codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: followup.clone(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+            })
+            .await,
+        "submit followup",
+    );
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Inspect the second request (parent turn) input contents.
@@ -763,13 +812,12 @@ async fn review_history_surfaces_in_parent_session() {
         assert_eq!(request.path(), "/v1/responses");
     }
     let body = requests[1].body_json();
-    let input = body["input"].as_array().expect("input array");
+    let input = require_some(body["input"].as_array(), "input array");
 
     // Must include the followup as the last item for this turn
-    let last = input.last().expect("at least one item in input");
-    assert_eq!(last["role"].as_str().unwrap(), "user");
-    let last_text = last["content"][0]["text"].as_str().unwrap();
-    assert_eq!(last_text, followup);
+    let last = require_some(input.last(), "at least one item in input");
+    assert_eq!(last["role"].as_str(), Some("user"));
+    assert_eq!(last["content"][0]["text"].as_str(), Some(followup.as_str()));
 
     // Ensure review-thread content is present for downstream turns.
     let contains_review_rollout_user = input.iter().any(|msg| {
@@ -806,18 +854,20 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     let sse_raw = r#"[{"type":"response.completed", "response": {"id": "__ID__"}}]"#;
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
 
-    let initial_cwd = TempDir::new().unwrap();
+    let initial_cwd = require_ok(TempDir::new(), "create initial cwd");
 
-    let repo_dir = TempDir::new().unwrap();
+    let repo_dir = require_ok(TempDir::new(), "create repo dir");
     let repo_path = repo_dir.path();
 
     fn run_git(repo_path: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(args)
-            .output()
-            .expect("spawn git");
+        let output = require_ok(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .args(args)
+                .output(),
+            "spawn git",
+        );
         assert!(
             output.status.success(),
             "git {:?} failed: stdout={:?} stderr={:?}",
@@ -830,55 +880,63 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     run_git(repo_path, &["init", "-b", "main"]);
     run_git(repo_path, &["config", "user.email", "test@example.com"]);
     run_git(repo_path, &["config", "user.name", "Test User"]);
-    std::fs::write(repo_path.join("file.txt"), "hello\n").unwrap();
+    require_ok(
+        std::fs::write(repo_path.join("file.txt"), "hello\n"),
+        "write repo file",
+    );
     run_git(repo_path, &["add", "."]);
     run_git(repo_path, &["commit", "-m", "initial"]);
 
-    let head_sha = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("rev-parse HEAD");
+    let head_sha = require_ok(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output(),
+        "rev-parse HEAD",
+    );
     assert!(head_sha.status.success());
-    let head_sha = String::from_utf8(head_sha.stdout)
-        .expect("utf8 sha")
+    let head_sha = require_ok(String::from_utf8(head_sha.stdout), "utf8 sha")
         .trim()
         .to_string();
 
-    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex_home = Arc::new(require_ok(TempDir::new(), "create temp dir"));
     let initial_cwd_path = initial_cwd.path().to_path_buf();
     let codex = new_conversation_for_server(&server, codex_home.clone(), move |config| {
         config.cwd = initial_cwd_path;
     })
     .await;
 
-    codex
-        .submit(Op::OverrideTurnContext {
-            cwd: Some(repo_path.to_path_buf()),
-            approval_policy: None,
-            sandbox_policy: None,
-            windows_sandbox_level: None,
-            model: None,
-            effort: None,
-            summary: None,
-            collaboration_mode: None,
-            personality: None,
-        })
-        .await
-        .unwrap();
+    require_ok(
+        codex
+            .submit(Op::OverrideTurnContext {
+                cwd: Some(repo_path.to_path_buf()),
+                approval_policy: None,
+                sandbox_policy: None,
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+            })
+            .await,
+        "override turn context",
+    );
 
-    codex
-        .submit(Op::Review {
-            review_request: ReviewRequest {
-                target: ReviewTarget::BaseBranch {
-                    branch: "main".to_string(),
+    require_ok(
+        codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::BaseBranch {
+                        branch: "main".to_string(),
+                    },
+                    user_facing_hint: None,
                 },
-                user_facing_hint: None,
-            },
-        })
-        .await
-        .unwrap();
+            })
+            .await,
+        "submit review",
+    );
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -889,7 +947,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
         assert_eq!(request.path(), "/v1/responses");
     }
     let body = requests[0].body_json();
-    let input = body["input"].as_array().expect("input array");
+    let input = require_some(body["input"].as_array(), "input array");
 
     let saw_merge_base_sha = input
         .iter()

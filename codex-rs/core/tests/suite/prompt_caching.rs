@@ -122,13 +122,7 @@ async fn prompt_tools_are_consistent_across_requests_impl(
         .await?;
     let base_instructions = thread_manager
         .get_models_manager()
-        .get_model_info(
-            config
-                .model
-                .as_deref()
-                .expect("test config should have a model"),
-            &config,
-        )
+        .get_model_info(config.model.as_deref().unwrap(), &config)
         .await
         .base_instructions;
 
@@ -172,16 +166,12 @@ async fn prompt_tools_are_consistent_across_requests_impl(
     };
 
     let body0 = req1.single_request().body_json();
-    let instructions0 = body0["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions0 = body0["instructions"].as_str().unwrap();
     assert_instructions_match(instructions0, &expected_instructions, slrv_enabled);
     assert_tool_names(&body0, &expected_tools_names);
 
     let body1 = req2.single_request().body_json();
-    let instructions1 = body1["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions1 = body1["instructions"].as_str().unwrap();
     assert_instructions_match(instructions1, &expected_instructions, slrv_enabled);
     assert_tool_names(&body1, &expected_tools_names);
 
@@ -242,15 +232,11 @@ async fn codex_mini_latest_tools_impl(slrv_enabled: bool) -> anyhow::Result<()> 
     let expected_instructions = [BASE_INSTRUCTIONS, APPLY_PATCH_TOOL_INSTRUCTIONS].join("\n");
 
     let body0 = req1.single_request().body_json();
-    let instructions0 = body0["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions0 = body0["instructions"].as_str().unwrap();
     assert_instructions_match(instructions0, &expected_instructions, slrv_enabled);
 
     let body1 = req2.single_request().body_json();
-    let instructions1 = body1["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions1 = body1["instructions"].as_str().unwrap();
     assert_instructions_match(instructions1, &expected_instructions, slrv_enabled);
 
     Ok(())
@@ -307,16 +293,14 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let body1 = req1.single_request().body_json();
-    let input1 = body1["input"].as_array().expect("input array");
+    let input1 = body1["input"].as_array().unwrap();
     assert_eq!(
         input1.len(),
         4,
         "expected permissions + cached prefix + env + user msg"
     );
 
-    let ui_text = input1[1]["content"][0]["text"]
-        .as_str()
-        .expect("ui message text");
+    let ui_text = input1[1]["content"][0]["text"].as_str().unwrap();
     assert!(
         ui_text.contains("be consistent and helpful"),
         "expected user instructions in UI message: {ui_text}"
@@ -333,7 +317,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     assert_eq!(input1[3], text_user_input("hello 1".to_string()));
 
     let body2 = req2.single_request().body_json();
-    let input2 = body2["input"].as_array().expect("input array");
+    let input2 = body2["input"].as_array().unwrap();
     assert_eq!(
         &input2[..input1.len()],
         input1.as_slice(),
@@ -422,7 +406,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
         "content": [ { "type": "input_text", "text": "hello 2" } ]
     });
     let expected_permissions_msg = body1["input"][0].clone();
-    let body1_input = body1["input"].as_array().expect("input array");
+    let body1_input = body1["input"].as_array().unwrap();
     // After overriding the turn context, emit two updated permissions messages.
     let expected_permissions_msg_2 = body2["input"][body1_input.len()].clone();
     let expected_permissions_msg_3 = body2["input"][body1_input.len() + 1].clone();
@@ -492,9 +476,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
             .and_then(|value| value.as_str()),
         Some("high")
     );
-    let input = body["input"]
-        .as_array()
-        .expect("input array must be present");
+    let input = body["input"].as_array().unwrap();
     assert!(
         !input.is_empty(),
         "expected at least environment context and user message"
@@ -663,7 +645,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
         "content": [ { "type": "input_text", "text": expected_env_text_2 } ]
     });
     let expected_permissions_msg = body1["input"][0].clone();
-    let body1_input = body1["input"].as_array().expect("input array");
+    let body1_input = body1["input"].as_array().unwrap();
     let expected_permissions_msg_2 = body2["input"][body1_input.len() + 1].clone();
     assert_ne!(
         expected_permissions_msg_2, expected_permissions_msg,
@@ -863,7 +845,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     ]);
     assert_eq!(body1["input"], expected_input_1);
 
-    let body1_input = body1["input"].as_array().expect("input array");
+    let body1_input = body1["input"].as_array().unwrap();
     let expected_permissions_msg_2 = body2["input"][body1_input.len()].clone();
     assert_ne!(
         expected_permissions_msg_2, expected_permissions_msg,
