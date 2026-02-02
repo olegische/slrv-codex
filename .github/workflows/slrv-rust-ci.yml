@@ -19,6 +19,10 @@ jobs:
         working-directory: codex-rs
     steps:
       - uses: actions/checkout@v6
+      # Some integration tests rely on DotSlash being installed.
+      # See https://github.com/openai/codex/pull/7617.
+      - name: Install DotSlash
+        uses: facebook/install-dotslash@v2
       - uses: dtolnay/rust-toolchain@1.93
         with:
           components: rustfmt, clippy
