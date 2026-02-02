@@ -1,0 +1,3 @@
+repo: olegische/slrv-codex
+tag: origin/main
+commit: c2dddb3ec390fd8d9ae51142b4a8fee30fbb5b36

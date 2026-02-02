@@ -1,0 +1,200 @@
+# Release workflow for SLRV overlay of codex-rs.
+# To release, follow a workflow like:
+# ```
+# git tag -a slrv-v0.1.0 -m "SLRV 0.1.0"
+# git push origin slrv-v0.1.0
+# ```
+
+name: slrv-rust-release
+on:
+  push:
+    tags:
+      - "slrv-v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  tag-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate tag matches slrv/VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Tag validation"
+
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
+            || { echo "Not a tag push"; exit 1; }
+          [[ "${GITHUB_REF_NAME}" =~ ^slrv-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
+            || { echo "Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
+
+          tag_ver="${GITHUB_REF_NAME#slrv-v}"
+          file_ver="$(cat slrv/VERSION)"
+          [[ -n "${file_ver}" ]] || { echo "slrv/VERSION is empty"; exit 1; }
+          [[ "${tag_ver}" == "${file_ver}" ]] \
+            || { echo "Tag ${tag_ver} != slrv/VERSION ${file_ver}"; exit 1; }
+
+          [[ -s UPSTREAM.txt ]] || { echo "UPSTREAM.txt missing or empty"; exit 1; }
+
+          echo "::group::Upstream provenance"
+          cat UPSTREAM.txt
+          echo "::endgroup::"
+
+          echo "Tag and slrv/VERSION agree (${tag_ver})"
+          echo "::endgroup::"
+
+  build:
+    needs: tag-check
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+          - runner: macos-15-xlarge
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install UBSan runtime (musl)
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libubsan1
+          fi
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          targets: ${{ matrix.target }}
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Use hermetic Cargo home (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/.cargo-home/bin/
+            ${{ github.workspace }}/.cargo-home/registry/index/
+            ${{ github.workspace }}/.cargo-home/registry/cache/
+            ${{ github.workspace }}/.cargo-home/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ matrix.runner }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Install musl build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Cargo build
+        shell: bash
+        run: |
+          cargo build --target ${{ matrix.target }} --release --bin codex
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          cp "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex" \
+            "${GITHUB_WORKSPACE}/dist/codex-${{ matrix.target }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-${{ matrix.target }}
+          path: dist/codex-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets/slrv
+          find artifacts -type f -maxdepth 3 -print0 | xargs -0 -I{} cp {} release-assets/
+          cp codex-rs/core/config.schema.json release-assets/config.schema.json
+          cp codex-rs/core/SLRV.md release-assets/SLRV.md
+          cp slrv/VERSION release-assets/slrv/VERSION
+          cp UPSTREAM.txt release-assets/UPSTREAM.txt
+          test -n "$(ls -A release-assets)" || { echo "release-assets empty"; exit 1; }
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#slrv-v}"
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+          {
+            echo "SLRV v${version}"
+            echo
+            echo "This is a research instrumentation release of Codex CLI."
+            echo
+            echo "SLRV version: ${version}"
+            echo "Upstream:"
+            cat UPSTREAM.txt
+            echo
+            echo "Artifacts:"
+            echo "- codex (binaries)"
+            echo "- config.schema.json"
+            echo "- SLRV.md"
+            echo "- slrv/VERSION"
+            echo "- UPSTREAM.txt"
+            echo
+            echo "No performance, safety, or alignment claims are made."
+          } > "${notes_path}"
+          echo "notes_path=${notes_path}" >> "$GITHUB_ENV"
+          echo "release_version=${version}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SLRV v${{ env.release_version }}
+          body_path: ${{ env.notes_path }}
+          files: release-assets/*
