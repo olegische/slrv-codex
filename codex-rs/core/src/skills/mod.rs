@@ -3,6 +3,8 @@ pub mod injection;
 pub mod loader;
 pub mod manager;
 pub mod model;
+pub mod permissions;
+pub mod remote;
 pub mod render;
 pub mod system;
 
@@ -16,4 +18,5 @@ pub use manager::SkillsManager;
 pub use model::SkillError;
 pub use model::SkillLoadOutcome;
 pub use model::SkillMetadata;
+pub use model::SkillPolicy;
 pub use render::render_skills_section;

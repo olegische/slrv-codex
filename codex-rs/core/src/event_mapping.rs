@@ -5,6 +5,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::items::WebSearchItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -69,7 +70,11 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     Some(UserMessageItem::new(&content))
 }
 
-fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMessageItem {
+fn parse_agent_message(
+    id: Option<&String>,
+    message: &[ContentItem],
+    phase: Option<MessagePhase>,
+) -> AgentMessageItem {
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
@@ -85,18 +90,23 @@ fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMes
         }
     }
     let id = id.cloned().unwrap_or_else(|| Uuid::new_v4().to_string());
-    AgentMessageItem { id, content }
+    AgentMessageItem { id, content, phase }
 }
 
 pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
     match item {
         ResponseItem::Message {
-            role, content, id, ..
+            role,
+            content,
+            id,
+            phase,
+            ..
         } => match role.as_str() {
             "user" => parse_user_message(content).map(TurnItem::UserMessage),
             "assistant" => Some(TurnItem::AgentMessage(parse_agent_message(
                 id.as_ref(),
                 content,
+                phase.clone(),
             ))),
             "system" => None,
             _ => None,
@@ -177,6 +187,7 @@ mod tests {
                 },
             ],
             end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -219,6 +230,7 @@ mod tests {
                 },
             ],
             end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -260,6 +272,7 @@ mod tests {
                 },
             ],
             end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -289,6 +302,7 @@ mod tests {
                     text: "<user_instructions>test_text</user_instructions>".to_string(),
                 }],
                 end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -297,6 +311,7 @@ mod tests {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
                 end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -305,6 +320,7 @@ mod tests {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
                 end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -314,6 +330,7 @@ mod tests {
                         .to_string(),
                 }],
                 end_turn: None,
+            phase: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -322,6 +339,7 @@ mod tests {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
                 end_turn: None,
+            phase: None,
             },
         ];
 
@@ -340,6 +358,7 @@ mod tests {
                 text: "Hello from Codex".to_string(),
             }],
             end_turn: None,
+            phase: None,
         };
 
         let turn_item = parse_turn_item(&item).expect("expected agent message turn item");

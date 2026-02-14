@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::protocol::common::AuthMode;
+use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ExecPolicyAmendment as CoreExecPolicyAmendment;
 use codex_protocol::config_types::CollaborationMode;
@@ -14,8 +15,13 @@ use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 use codex_protocol::items::TurnItem as CoreTurnItem;
+use codex_protocol::mcp::Resource as McpResource;
+use codex_protocol::mcp::ResourceTemplate as McpResourceTemplate;
+use codex_protocol::mcp::Tool as McpTool;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
@@ -23,9 +29,12 @@ use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
+use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
+use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SkillDependencies as CoreSkillDependencies;
 use codex_protocol::protocol::SkillErrorInfo as CoreSkillErrorInfo;
@@ -40,10 +49,6 @@ use codex_protocol::user_input::ByteRange as CoreByteRange;
 use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use mcp_types::ContentBlock as McpContentBlock;
-use mcp_types::Resource as McpResource;
-use mcp_types::ResourceTemplate as McpResourceTemplate;
-use mcp_types::Tool as McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -86,10 +91,7 @@ macro_rules! v2_enum_from_core {
 pub enum CodexErrorInfo {
     ContextWindowExceeded,
     UsageLimitExceeded,
-    ModelCap {
-        model: String,
-        reset_after_seconds: Option<u64>,
-    },
+    ServerOverloaded,
     HttpConnectionFailed {
         #[serde(rename = "httpStatusCode")]
         #[ts(rename = "httpStatusCode")]
@@ -126,13 +128,7 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
         match value {
             CoreCodexErrorInfo::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
             CoreCodexErrorInfo::UsageLimitExceeded => CodexErrorInfo::UsageLimitExceeded,
-            CoreCodexErrorInfo::ModelCap {
-                model,
-                reset_after_seconds,
-            } => CodexErrorInfo::ModelCap {
-                model,
-                reset_after_seconds,
-            },
+            CoreCodexErrorInfo::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
             CoreCodexErrorInfo::HttpConnectionFailed { http_status_code } => {
                 CodexErrorInfo::HttpConnectionFailed { http_status_code }
             }
@@ -375,6 +371,40 @@ pub struct AnalyticsConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
+pub enum AppDisabledReason {
+    Unknown,
+    User,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub disabled_reason: Option<AppDisabledReason>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppsConfig {
+    #[serde(default, flatten)]
+    #[schemars(with = "HashMap<String, AppConfig>")]
+    pub apps: HashMap<String, AppConfig>,
+}
+
+const fn default_enabled() -> bool {
+    true
+}
+
+const fn default_include_platform_defaults() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
 pub struct Config {
     pub model: Option<String>,
     pub review_model: Option<String>,
@@ -398,6 +428,9 @@ pub struct Config {
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
     pub analytics: Option<AnalyticsConfig>,
+    #[experimental("config/read.apps")]
+    #[serde(default)]
+    pub apps: Option<AppsConfig>,
     #[serde(default, flatten)]
     pub additional: HashMap<String, JsonValue>,
 }
@@ -478,6 +511,7 @@ pub struct ConfigReadParams {
     /// Optional working directory to resolve project config layers. If specified,
     /// return the effective config as seen from that directory (i.e., including any
     /// project layers between `cwd` and the project/repo root).
+    #[ts(optional = nullable)]
     pub cwd: Option<String>,
 }
 
@@ -491,13 +525,32 @@ pub struct ConfigReadResponse {
     pub layers: Option<Vec<ConfigLayer>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ConfigRequirements {
     pub allowed_approval_policies: Option<Vec<AskForApproval>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxMode>>,
+    pub allowed_web_search_modes: Option<Vec<WebSearchMode>>,
     pub enforce_residency: Option<ResidencyRequirement>,
+    #[experimental("configRequirements/read.network")]
+    pub network: Option<NetworkRequirements>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct NetworkRequirements {
+    pub enabled: Option<bool>,
+    pub http_port: Option<u16>,
+    pub socks_port: Option<u16>,
+    pub allow_upstream_proxy: Option<bool>,
+    pub dangerously_allow_non_loopback_proxy: Option<bool>,
+    pub dangerously_allow_non_loopback_admin: Option<bool>,
+    pub allowed_domains: Option<Vec<String>>,
+    pub denied_domains: Option<Vec<String>>,
+    pub allow_unix_sockets: Option<Vec<String>>,
+    pub allow_local_binding: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -523,7 +576,9 @@ pub struct ConfigValueWriteParams {
     pub value: JsonValue,
     pub merge_strategy: MergeStrategy,
     /// Path to the config file to write; defaults to the user's `config.toml` when omitted.
+    #[ts(optional = nullable)]
     pub file_path: Option<String>,
+    #[ts(optional = nullable)]
     pub expected_version: Option<String>,
 }
 
@@ -533,7 +588,9 @@ pub struct ConfigValueWriteParams {
 pub struct ConfigBatchWriteParams {
     pub edits: Vec<ConfigEdit>,
     /// Path to the config file to write; defaults to the user's `config.toml` when omitted.
+    #[ts(optional = nullable)]
     pub file_path: Option<String>,
+    #[ts(optional = nullable)]
     pub expected_version: Option<String>,
 }
 
@@ -588,13 +645,65 @@ pub enum NetworkAccess {
     Enabled,
 }
 
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum ReadOnlyAccess {
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Restricted {
+        #[serde(default = "default_include_platform_defaults")]
+        include_platform_defaults: bool,
+        #[serde(default)]
+        readable_roots: Vec<AbsolutePathBuf>,
+    },
+    #[default]
+    FullAccess,
+}
+
+impl ReadOnlyAccess {
+    pub fn to_core(&self) -> CoreReadOnlyAccess {
+        match self {
+            ReadOnlyAccess::Restricted {
+                include_platform_defaults,
+                readable_roots,
+            } => CoreReadOnlyAccess::Restricted {
+                include_platform_defaults: *include_platform_defaults,
+                readable_roots: readable_roots.clone(),
+            },
+            ReadOnlyAccess::FullAccess => CoreReadOnlyAccess::FullAccess,
+        }
+    }
+}
+
+impl From<CoreReadOnlyAccess> for ReadOnlyAccess {
+    fn from(value: CoreReadOnlyAccess) -> Self {
+        match value {
+            CoreReadOnlyAccess::Restricted {
+                include_platform_defaults,
+                readable_roots,
+            } => ReadOnlyAccess::Restricted {
+                include_platform_defaults,
+                readable_roots,
+            },
+            CoreReadOnlyAccess::FullAccess => ReadOnlyAccess::FullAccess,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum SandboxPolicy {
     DangerFullAccess,
-    ReadOnly,
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    ReadOnly {
+        #[serde(default)]
+        access: ReadOnlyAccess,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     ExternalSandbox {
@@ -606,6 +715,8 @@ pub enum SandboxPolicy {
     WorkspaceWrite {
         #[serde(default)]
         writable_roots: Vec<AbsolutePathBuf>,
+        #[serde(default)]
+        read_only_access: ReadOnlyAccess,
         #[serde(default)]
         network_access: bool,
         #[serde(default)]
@@ -621,7 +732,11 @@ impl SandboxPolicy {
             SandboxPolicy::DangerFullAccess => {
                 codex_protocol::protocol::SandboxPolicy::DangerFullAccess
             }
-            SandboxPolicy::ReadOnly => codex_protocol::protocol::SandboxPolicy::ReadOnly,
+            SandboxPolicy::ReadOnly { access } => {
+                codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                    access: access.to_core(),
+                }
+            }
             SandboxPolicy::ExternalSandbox { network_access } => {
                 codex_protocol::protocol::SandboxPolicy::ExternalSandbox {
                     network_access: match network_access {
@@ -632,11 +747,13 @@ impl SandboxPolicy {
             }
             SandboxPolicy::WorkspaceWrite {
                 writable_roots,
+                read_only_access,
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             } => codex_protocol::protocol::SandboxPolicy::WorkspaceWrite {
                 writable_roots: writable_roots.clone(),
+                read_only_access: read_only_access.to_core(),
                 network_access: *network_access,
                 exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
                 exclude_slash_tmp: *exclude_slash_tmp,
@@ -651,7 +768,11 @@ impl From<codex_protocol::protocol::SandboxPolicy> for SandboxPolicy {
             codex_protocol::protocol::SandboxPolicy::DangerFullAccess => {
                 SandboxPolicy::DangerFullAccess
             }
-            codex_protocol::protocol::SandboxPolicy::ReadOnly => SandboxPolicy::ReadOnly,
+            codex_protocol::protocol::SandboxPolicy::ReadOnly { access } => {
+                SandboxPolicy::ReadOnly {
+                    access: ReadOnlyAccess::from(access),
+                }
+            }
             codex_protocol::protocol::SandboxPolicy::ExternalSandbox { network_access } => {
                 SandboxPolicy::ExternalSandbox {
                     network_access: match network_access {
@@ -662,11 +783,13 @@ impl From<codex_protocol::protocol::SandboxPolicy> for SandboxPolicy {
             }
             codex_protocol::protocol::SandboxPolicy::WorkspaceWrite {
                 writable_roots,
+                read_only_access,
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             } => SandboxPolicy::WorkspaceWrite {
                 writable_roots,
+                read_only_access: ReadOnlyAccess::from(read_only_access),
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
@@ -828,7 +951,7 @@ pub enum Account {
     Chatgpt { email: String, plan_type: PlanType },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(tag = "type")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -845,21 +968,21 @@ pub enum LoginAccountParams {
     Chatgpt,
     /// [UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.
     /// The access token must contain the same scopes that Codex-managed ChatGPT auth tokens have.
-    #[serde(rename = "chatgptAuthTokens")]
-    #[ts(rename = "chatgptAuthTokens")]
+    #[experimental("account/login/start.chatgptAuthTokens")]
+    #[serde(rename = "chatgptAuthTokens", rename_all = "camelCase")]
+    #[ts(rename = "chatgptAuthTokens", rename_all = "camelCase")]
     ChatgptAuthTokens {
-        /// ID token (JWT) supplied by the client.
-        ///
-        /// This token is used for identity and account metadata (email, plan type,
-        /// workspace id).
-        #[serde(rename = "idToken")]
-        #[ts(rename = "idToken")]
-        id_token: String,
         /// Access token (JWT) supplied by the client.
-        /// This token is used for backend API requests.
-        #[serde(rename = "accessToken")]
-        #[ts(rename = "accessToken")]
+        /// This token is used for backend API requests and email extraction.
         access_token: String,
+        /// Workspace/account identifier supplied by the client.
+        chatgpt_account_id: String,
+        /// Optional plan type supplied by the client.
+        ///
+        /// When `null`, Codex attempts to derive the plan type from access-token
+        /// claims. If unavailable, the plan defaults to `unknown`.
+        #[ts(optional = nullable)]
+        chatgpt_plan_type: Option<String>,
     },
 }
 
@@ -931,8 +1054,9 @@ pub struct ChatgptAuthTokensRefreshParams {
     /// Clients that manage multiple accounts/workspaces can use this as a hint
     /// to refresh the token for the correct workspace.
     ///
-    /// This may be `null` when the prior ID token did not include a workspace
-    /// identifier (`chatgpt_account_id`) or when the token could not be parsed.
+    /// This may be `null` when the prior auth state did not include a workspace
+    /// identifier (`chatgpt_account_id`).
+    #[ts(optional = nullable)]
     pub previous_account_id: Option<String>,
 }
 
@@ -940,15 +1064,19 @@ pub struct ChatgptAuthTokensRefreshParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ChatgptAuthTokensRefreshResponse {
-    pub id_token: String,
     pub access_token: String,
+    pub chatgpt_account_id: String,
+    pub chatgpt_plan_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountRateLimitsResponse {
+    /// Backward-compatible single-bucket view; mirrors the historical payload.
     pub rate_limits: RateLimitSnapshot,
+    /// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
+    pub rate_limits_by_limit_id: Option<HashMap<String, RateLimitSnapshot>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -977,9 +1105,14 @@ pub struct GetAccountResponse {
 #[ts(export_to = "v2/")]
 pub struct ModelListParams {
     /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     /// Optional page size; defaults to a reasonable server-side value.
+    #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// When true, include models that are hidden from the default picker list.
+    #[ts(optional = nullable)]
+    pub include_hidden: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -988,10 +1121,14 @@ pub struct ModelListParams {
 pub struct Model {
     pub id: String,
     pub model: String,
+    pub upgrade: Option<String>,
     pub display_name: String,
     pub description: String,
+    pub hidden: bool,
     pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
     pub default_reasoning_effort: ReasoningEffort,
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<InputModality>,
     #[serde(default)]
     pub supports_personality: bool,
     // Only one model should be marked as default.
@@ -1030,13 +1167,76 @@ pub struct CollaborationModeListResponse {
     pub data: Vec<CollaborationModeMask>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExperimentalFeatureListParams {
+    /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    /// Optional page size; defaults to a reasonable server-side value.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ExperimentalFeatureStage {
+    /// Feature is available for user testing and feedback.
+    Beta,
+    /// Feature is still being built and not ready for broad use.
+    UnderDevelopment,
+    /// Feature is production-ready.
+    Stable,
+    /// Feature is deprecated and should be avoided.
+    Deprecated,
+    /// Feature flag is retained only for backwards compatibility.
+    Removed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExperimentalFeature {
+    /// Stable key used in config.toml and CLI flag toggles.
+    pub name: String,
+    /// Lifecycle stage of this feature flag.
+    pub stage: ExperimentalFeatureStage,
+    /// User-facing display name shown in the experimental features UI.
+    /// Null when this feature is not in beta.
+    pub display_name: Option<String>,
+    /// Short summary describing what the feature does.
+    /// Null when this feature is not in beta.
+    pub description: Option<String>,
+    /// Announcement copy shown to users when the feature is introduced.
+    /// Null when this feature is not in beta.
+    pub announcement: Option<String>,
+    /// Whether this feature is currently enabled in the loaded config.
+    pub enabled: bool,
+    /// Whether this feature is enabled by default.
+    pub default_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExperimentalFeatureListResponse {
+    pub data: Vec<ExperimentalFeature>,
+    /// Opaque cursor to pass to the next call to continue after the last item.
+    /// If None, there are no more items to return.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ListMcpServerStatusParams {
     /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     /// Optional page size; defaults to a server-defined value.
+    #[ts(optional = nullable)]
     pub limit: Option<u32>,
 }
 
@@ -1064,16 +1264,26 @@ pub struct ListMcpServerStatusResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// EXPERIMENTAL - list available apps/connectors.
 pub struct AppsListParams {
     /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     /// Optional page size; defaults to a reasonable server-side value.
+    #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// Optional thread id used to evaluate app feature gating from that thread's config.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
+    /// When true, bypass app caches and fetch the latest data from sources.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_refetch: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// EXPERIMENTAL - app metadata returned by app-list APIs.
 pub struct AppInfo {
     pub id: String,
     pub name: String,
@@ -1084,16 +1294,33 @@ pub struct AppInfo {
     pub install_url: Option<String>,
     #[serde(default)]
     pub is_accessible: bool,
+    /// Whether this app is enabled in config.toml.
+    /// Example:
+    /// ```toml
+    /// [apps.bad_app]
+    /// enabled = false
+    /// ```
+    #[serde(default = "default_enabled")]
+    pub is_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// EXPERIMENTAL - app list response.
 pub struct AppsListResponse {
     pub data: Vec<AppInfo>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// If None, there are no more items to return.
     pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+/// EXPERIMENTAL - notification emitted when the app list changes.
+pub struct AppListUpdatedNotification {
+    pub data: Vec<AppInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1112,10 +1339,10 @@ pub struct McpServerRefreshResponse {}
 pub struct McpServerOauthLoginParams {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub timeout_secs: Option<i64>,
 }
 
@@ -1131,7 +1358,9 @@ pub struct McpServerOauthLoginResponse {
 #[ts(export_to = "v2/")]
 pub struct FeedbackUploadParams {
     pub classification: String,
+    #[ts(optional = nullable)]
     pub reason: Option<String>,
+    #[ts(optional = nullable)]
     pub thread_id: Option<String>,
     pub include_logs: bool,
 }
@@ -1149,8 +1378,11 @@ pub struct FeedbackUploadResponse {
 pub struct CommandExecParams {
     pub command: Vec<String>,
     #[ts(type = "number | null")]
+    #[ts(optional = nullable)]
     pub timeout_ms: Option<i64>,
+    #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
+    #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
 }
 
@@ -1165,27 +1397,67 @@ pub struct CommandExecResponse {
 
 // === Threads, Turns, and Items ===
 // Thread APIs
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
+#[derive(
+    Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartParams {
+    #[ts(optional = nullable)]
     pub model: Option<String>,
+    #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
+    #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    #[ts(optional = nullable)]
     pub config: Option<HashMap<String, JsonValue>>,
+    #[ts(optional = nullable)]
     pub base_instructions: Option<String>,
+    #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    #[experimental("thread/start.dynamicTools")]
+    #[ts(optional = nullable)]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
-    /// If true, opt into emitting raw response items on the event stream.
-    ///
+    /// Test-only experimental field used to validate experimental gating and
+    /// schema filtering behavior in a stable way.
+    #[experimental("thread/start.mockExperimentalField")]
+    #[ts(optional = nullable)]
+    pub mock_experimental_field: Option<String>,
+    /// If true, opt into emitting raw Responses API items on the event stream.
     /// This is for internal use only (e.g. Codex Cloud).
-    /// (TODO): Figure out a better way to categorize internal / experimental events & protocols.
+    #[experimental("thread/start.experimentalRawEvents")]
     #[serde(default)]
     pub experimental_raw_events: bool,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on resume/fork/read.
+    #[experimental("thread/start.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MockExperimentalMethodParams {
+    /// Test-only payload field.
+    #[ts(optional = nullable)]
+    pub value: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MockExperimentalMethodResponse {
+    /// Echoes the input `value`.
+    pub echoed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1201,7 +1473,9 @@ pub struct ThreadStartResponse {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// There are three ways to resume a thread:
@@ -1219,22 +1493,40 @@ pub struct ThreadResumeParams {
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
     /// If specified, the thread will be resumed with the provided history
     /// instead of loaded from disk.
+    #[experimental("thread/resume.history")]
+    #[ts(optional = nullable)]
     pub history: Option<Vec<ResponseItem>>,
 
     /// [UNSTABLE] Specify the rollout path to resume from.
     /// If specified, the thread_id param will be ignored.
+    #[experimental("thread/resume.path")]
+    #[ts(optional = nullable)]
     pub path: Option<PathBuf>,
 
     /// Configuration overrides for the resumed thread, if any.
+    #[ts(optional = nullable)]
     pub model: Option<String>,
+    #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
+    #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    #[ts(optional = nullable)]
     pub config: Option<HashMap<String, serde_json::Value>>,
+    #[ts(optional = nullable)]
     pub base_instructions: Option<String>,
+    #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on subsequent resume/fork/read.
+    #[experimental("thread/resume.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1250,7 +1542,9 @@ pub struct ThreadResumeResponse {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// There are two ways to fork a thread:
@@ -1265,17 +1559,32 @@ pub struct ThreadForkParams {
 
     /// [UNSTABLE] Specify the rollout path to fork from.
     /// If specified, the thread_id param will be ignored.
+    #[experimental("thread/fork.path")]
+    #[ts(optional = nullable)]
     pub path: Option<PathBuf>,
 
     /// Configuration overrides for the forked thread, if any.
+    #[ts(optional = nullable)]
     pub model: Option<String>,
+    #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
+    #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    #[ts(optional = nullable)]
     pub config: Option<HashMap<String, serde_json::Value>>,
+    #[ts(optional = nullable)]
     pub base_instructions: Option<String>,
+    #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on subsequent resume/fork/read.
+    #[experimental("thread/fork.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1333,6 +1642,30 @@ pub struct ThreadUnarchiveResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct ThreadCompactStartParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadCompactStartResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadBackgroundTerminalsCleanParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadBackgroundTerminalsCleanResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ThreadRollbackParams {
     pub thread_id: String,
     /// The number of turns to drop from the end of the thread. Must be >= 1.
@@ -1359,20 +1692,30 @@ pub struct ThreadRollbackResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadListParams {
     /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     /// Optional page size; defaults to a reasonable server-side value.
+    #[ts(optional = nullable)]
     pub limit: Option<u32>,
     /// Optional sort key; defaults to created_at.
+    #[ts(optional = nullable)]
     pub sort_key: Option<ThreadSortKey>,
     /// Optional provider filter; when set, only sessions recorded under these
     /// providers are returned. When present but empty, includes all providers.
+    #[ts(optional = nullable)]
     pub model_providers: Option<Vec<String>>,
     /// Optional source filter; when set, only sessions from these source kinds
     /// are returned. When omitted or empty, defaults to interactive sources.
+    #[ts(optional = nullable)]
     pub source_kinds: Option<Vec<ThreadSourceKind>>,
     /// Optional archived filter; when set to true, only archived threads are returned.
     /// If false or null, only non-archived threads are returned.
+    #[ts(optional = nullable)]
     pub archived: Option<bool>,
+    /// Optional cwd filter; when set, only threads whose session cwd exactly
+    /// matches this path are returned.
+    #[ts(optional = nullable)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -1416,8 +1759,10 @@ pub struct ThreadListResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadLoadedListParams {
     /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     /// Optional page size; defaults to no limit.
+    #[ts(optional = nullable)]
     pub limit: Option<u32>,
 }
 
@@ -1460,6 +1805,19 @@ pub struct SkillsListParams {
     /// When true, bypass the skills cache and re-scan skills from disk.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force_reload: bool,
+
+    /// Optional per-cwd extra roots to scan as user-scoped skills.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub per_cwd_extra_user_roots: Option<Vec<SkillsListExtraRootsForCwd>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SkillsListExtraRootsForCwd {
+    pub cwd: PathBuf,
+    pub extra_user_roots: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1467,6 +1825,44 @@ pub struct SkillsListParams {
 #[ts(export_to = "v2/")]
 pub struct SkillsListResponse {
     pub data: Vec<SkillsListEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SkillsRemoteReadParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct RemoteSkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SkillsRemoteReadResponse {
+    pub data: Vec<RemoteSkillSummary>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SkillsRemoteWriteParams {
+    pub hazelnut_id: String,
+    pub is_preload: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SkillsRemoteWriteResponse {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -1798,31 +2194,46 @@ pub enum TurnStatus {
 }
 
 // Turn APIs
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnStartParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     /// Override the working directory for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
     /// Override the approval policy for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
     /// Override the sandbox policy for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
     /// Override the model for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub model: Option<String>,
     /// Override the reasoning effort for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub effort: Option<ReasoningEffort>,
     /// Override the reasoning summary for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub summary: Option<ReasoningSummary>,
     /// Override the personality for this turn and subsequent turns.
+    #[ts(optional = nullable)]
     pub personality: Option<Personality>,
     /// Optional JSON Schema used to constrain the final assistant message for this turn.
+    #[ts(optional = nullable)]
     pub output_schema: Option<JsonValue>,
 
-    /// EXPERIMENTAL - set a pre-set collaboration mode.
+    /// EXPERIMENTAL - Set a pre-set collaboration mode.
     /// Takes precedence over model, reasoning_effort, and developer instructions if set.
+    ///
+    /// For `collaboration_mode.settings.developer_instructions`, `null` means
+    /// "use the built-in instructions for the selected mode".
+    #[experimental("turn/start.collaborationMode")]
+    #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
 }
 
@@ -1836,6 +2247,7 @@ pub struct ReviewStartParams {
     /// Where to run the review: inline (default) on the current thread or
     /// detached on a new thread (returned in `reviewThreadId`).
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub delivery: Option<ReviewDelivery>,
 }
 
@@ -1883,6 +2295,24 @@ pub enum ReviewTarget {
 #[ts(export_to = "v2/")]
 pub struct TurnStartResponse {
     pub turn: Turn,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnSteerParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+    /// Required active turn id precondition. The request fails when it does not
+    /// match the currently active turn.
+    pub expected_turn_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnSteerResponse {
+    pub turn_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -2143,6 +2573,7 @@ pub enum ThreadItem {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type", rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub enum WebSearchAction {
     Search {
         query: Option<String>,
@@ -2224,12 +2655,29 @@ pub enum CommandExecutionStatus {
     Declined,
 }
 
+impl From<CoreExecCommandStatus> for CommandExecutionStatus {
+    fn from(value: CoreExecCommandStatus) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&CoreExecCommandStatus> for CommandExecutionStatus {
+    fn from(value: &CoreExecCommandStatus) -> Self {
+        match value {
+            CoreExecCommandStatus::Completed => CommandExecutionStatus::Completed,
+            CoreExecCommandStatus::Failed => CommandExecutionStatus::Failed,
+            CoreExecCommandStatus::Declined => CommandExecutionStatus::Declined,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub enum CollabAgentTool {
     SpawnAgent,
     SendInput,
+    ResumeAgent,
     Wait,
     CloseAgent,
 }
@@ -2261,6 +2709,22 @@ pub enum PatchApplyStatus {
     Completed,
     Failed,
     Declined,
+}
+
+impl From<CorePatchApplyStatus> for PatchApplyStatus {
+    fn from(value: CorePatchApplyStatus) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&CorePatchApplyStatus> for PatchApplyStatus {
+    fn from(value: &CorePatchApplyStatus) -> Self {
+        match value {
+            CorePatchApplyStatus::Completed => PatchApplyStatus::Completed,
+            CorePatchApplyStatus::Failed => PatchApplyStatus::Failed,
+            CorePatchApplyStatus::Declined => PatchApplyStatus::Declined,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -2336,7 +2800,12 @@ impl From<CoreAgentStatus> for CollabAgentState {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpToolCallResult {
-    pub content: Vec<McpContentBlock>,
+    // NOTE: `rmcp::model::Content` (and its `RawContent` variants) would be a more precise Rust
+    // representation of MCP content blocks. We intentionally use `serde_json::Value` here because
+    // this crate exports JSON schema + TS types (`schemars`/`ts-rs`), and the rmcp model types
+    // aren't set up to be schema/TS friendly (and would introduce heavier coupling to rmcp's Rust
+    // representations). Using `JsonValue` keeps the payload wire-shaped and easy to export.
+    pub content: Vec<JsonValue>,
     pub structured_content: Option<JsonValue>,
 }
 
@@ -2611,20 +3080,22 @@ pub struct CommandExecutionRequestApprovalParams {
     pub turn_id: String,
     pub item_id: String,
     /// Optional explanatory reason (e.g. request for network access).
+    #[ts(optional = nullable)]
     pub reason: Option<String>,
     /// The command to be executed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub command: Option<String>,
     /// The command's working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
     /// Best-effort parsed command actions for friendly display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional = nullable)]
     pub command_actions: Option<Vec<CommandAction>>,
     /// Optional proposed execpolicy amendment to allow similar commands without prompting.
+    #[ts(optional = nullable)]
     pub proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
 }
 
@@ -2643,9 +3114,11 @@ pub struct FileChangeRequestApprovalParams {
     pub turn_id: String,
     pub item_id: String,
     /// Optional explanatory reason (e.g. request for extra write access).
+    #[ts(optional = nullable)]
     pub reason: Option<String>,
     /// [UNSTABLE] When set, the agent is asking the user to allow writes under this root
     /// for the remainder of the session (unclear if this is honored today).
+    #[ts(optional = nullable)]
     pub grant_root: Option<PathBuf>,
 }
 
@@ -2670,8 +3143,32 @@ pub struct DynamicToolCallParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct DynamicToolCallResponse {
-    pub output: String,
+    pub content_items: Vec<DynamicToolCallOutputContentItem>,
     pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum DynamicToolCallOutputContentItem {
+    #[serde(rename_all = "camelCase")]
+    InputText { text: String },
+    #[serde(rename_all = "camelCase")]
+    InputImage { image_url: String },
+}
+
+impl From<DynamicToolCallOutputContentItem>
+    for codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem
+{
+    fn from(item: DynamicToolCallOutputContentItem) -> Self {
+        match item {
+            DynamicToolCallOutputContentItem::InputText { text } => Self::InputText { text },
+            DynamicToolCallOutputContentItem::InputImage { image_url } => {
+                Self::InputImage { image_url }
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -2736,6 +3233,8 @@ pub struct AccountRateLimitsUpdatedNotification {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct RateLimitSnapshot {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
@@ -2745,6 +3244,8 @@ pub struct RateLimitSnapshot {
 impl From<CoreRateLimitSnapshot> for RateLimitSnapshot {
     fn from(value: CoreRateLimitSnapshot) -> Self {
         Self {
+            limit_id: value.limit_id,
+            limit_name: value.limit_name,
             primary: value.primary.map(RateLimitWindow::from),
             secondary: value.secondary.map(RateLimitWindow::from),
             credits: value.credits.map(CreditsSnapshot::from),
@@ -2861,10 +3362,20 @@ mod tests {
     use codex_protocol::items::WebSearchItem;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+    use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
     use codex_protocol::user_input::UserInput as CoreUserInput;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn test_absolute_path() -> AbsolutePathBuf {
+        let path = if cfg!(windows) {
+            r"C:\readable"
+        } else {
+            "/readable"
+        };
+        AbsolutePathBuf::from_absolute_path(path).expect("path must be absolute")
+    }
 
     #[test]
     fn sandbox_policy_round_trips_external_sandbox_network_access() {
@@ -2882,6 +3393,100 @@ mod tests {
 
         let back_to_v2 = SandboxPolicy::from(core_policy);
         assert_eq!(back_to_v2, v2_policy);
+    }
+
+    #[test]
+    fn sandbox_policy_round_trips_read_only_access() {
+        let readable_root = test_absolute_path();
+        let v2_policy = SandboxPolicy::ReadOnly {
+            access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: false,
+                readable_roots: vec![readable_root.clone()],
+            },
+        };
+
+        let core_policy = v2_policy.to_core();
+        assert_eq!(
+            core_policy,
+            codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                access: CoreReadOnlyAccess::Restricted {
+                    include_platform_defaults: false,
+                    readable_roots: vec![readable_root],
+                },
+            }
+        );
+
+        let back_to_v2 = SandboxPolicy::from(core_policy);
+        assert_eq!(back_to_v2, v2_policy);
+    }
+
+    #[test]
+    fn sandbox_policy_round_trips_workspace_write_read_only_access() {
+        let readable_root = test_absolute_path();
+        let v2_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            read_only_access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: false,
+                readable_roots: vec![readable_root.clone()],
+            },
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+
+        let core_policy = v2_policy.to_core();
+        assert_eq!(
+            core_policy,
+            codex_protocol::protocol::SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                read_only_access: CoreReadOnlyAccess::Restricted {
+                    include_platform_defaults: false,
+                    readable_roots: vec![readable_root],
+                },
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+
+        let back_to_v2 = SandboxPolicy::from(core_policy);
+        assert_eq!(back_to_v2, v2_policy);
+    }
+
+    #[test]
+    fn sandbox_policy_deserializes_legacy_read_only_without_access_field() {
+        let policy: SandboxPolicy = serde_json::from_value(json!({
+            "type": "readOnly"
+        }))
+        .expect("read-only policy should deserialize");
+        assert_eq!(
+            policy,
+            SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_deserializes_legacy_workspace_write_without_read_only_access_field() {
+        let policy: SandboxPolicy = serde_json::from_value(json!({
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": false,
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false
+        }))
+        .expect("workspace-write policy should deserialize");
+        assert_eq!(
+            policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                read_only_access: ReadOnlyAccess::FullAccess,
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
     }
 
     #[test]
@@ -2947,6 +3552,7 @@ mod tests {
                     text: "world".to_string(),
                 },
             ],
+            phase: None,
         });
 
         assert_eq!(
@@ -3000,20 +3606,36 @@ mod tests {
             serde_json::to_value(SkillsListParams {
                 cwds: Vec::new(),
                 force_reload: false,
+                per_cwd_extra_user_roots: None,
             })
             .unwrap(),
-            json!({}),
+            json!({
+                "perCwdExtraUserRoots": null,
+            }),
         );
 
         assert_eq!(
             serde_json::to_value(SkillsListParams {
                 cwds: vec![PathBuf::from("/repo")],
                 force_reload: true,
+                per_cwd_extra_user_roots: Some(vec![SkillsListExtraRootsForCwd {
+                    cwd: PathBuf::from("/repo"),
+                    extra_user_roots: vec![
+                        PathBuf::from("/shared/skills"),
+                        PathBuf::from("/tmp/x")
+                    ],
+                }]),
             })
             .unwrap(),
             json!({
                 "cwds": ["/repo"],
                 "forceReload": true,
+                "perCwdExtraUserRoots": [
+                    {
+                        "cwd": "/repo",
+                        "extraUserRoots": ["/shared/skills", "/tmp/x"],
+                    }
+                ],
             }),
         );
     }
@@ -3030,6 +3652,63 @@ mod tests {
                 "responseTooManyFailedAttempts": {
                     "httpStatusCode": 401
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_response_serializes_content_items() {
+        let value = serde_json::to_value(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "dynamic-ok".to_string(),
+            }],
+            success: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": "dynamic-ok"
+                    }
+                ],
+                "success": true,
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_response_serializes_text_and_image_content_items() {
+        let value = serde_json::to_value(DynamicToolCallResponse {
+            content_items: vec![
+                DynamicToolCallOutputContentItem::InputText {
+                    text: "dynamic-ok".to_string(),
+                },
+                DynamicToolCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                },
+            ],
+            success: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": "dynamic-ok"
+                    },
+                    {
+                        "type": "inputImage",
+                        "imageUrl": "data:image/png;base64,AAA"
+                    }
+                ],
+                "success": true,
             })
         );
     }

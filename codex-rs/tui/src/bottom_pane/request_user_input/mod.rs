@@ -27,6 +27,7 @@ use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::scroll_state::ScrollState;
 use crate::bottom_pane::selection_popup_common::GenericDisplayRow;
 use crate::bottom_pane::selection_popup_common::measure_rows_height;
+use crate::history_cell;
 use crate::render::renderable::Renderable;
 
 use codex_core::protocol::Op;
@@ -279,9 +280,12 @@ impl RequestUserInputOverlay {
                         let prefix = if selected { '›' } else { ' ' };
                         let label = opt.label.as_str();
                         let number = idx + 1;
+                        let prefix_label = format!("{prefix} {number}. ");
+                        let wrap_indent = UnicodeWidthStr::width(prefix_label.as_str());
                         GenericDisplayRow {
-                            name: format!("{prefix} {number}. {label}"),
+                            name: format!("{prefix_label}{label}"),
                             description: Some(opt.description.clone()),
+                            wrap_indent: Some(wrap_indent),
                             ..Default::default()
                         }
                     })
@@ -292,9 +296,12 @@ impl RequestUserInputOverlay {
                     let selected = selected_idx.is_some_and(|sel| sel == idx);
                     let prefix = if selected { '›' } else { ' ' };
                     let number = idx + 1;
+                    let prefix_label = format!("{prefix} {number}. ");
+                    let wrap_indent = UnicodeWidthStr::width(prefix_label.as_str());
                     rows.push(GenericDisplayRow {
-                        name: format!("{prefix} {number}. {OTHER_OPTION_LABEL}"),
+                        name: format!("{prefix_label}{OTHER_OPTION_LABEL}"),
                         description: Some(OTHER_OPTION_DESCRIPTION.to_string()),
+                        wrap_indent: Some(wrap_indent),
                         ..Default::default()
                     });
                 }
@@ -426,8 +433,8 @@ impl RequestUserInputOverlay {
             if self.selected_option_index().is_some() && !notes_visible {
                 tips.push(FooterTip::highlighted("tab to add notes"));
             }
-            if self.selected_option_index().is_some() && notes_visible && self.focus_is_notes() {
-                tips.push(FooterTip::new("tab to clear notes"));
+            if self.selected_option_index().is_some() && notes_visible {
+                tips.push(FooterTip::new("tab or esc to clear notes"));
             }
         }
 
@@ -442,13 +449,15 @@ impl RequestUserInputOverlay {
         };
         tips.push(enter_tip);
         if question_count > 1 {
-            if is_last_question {
-                tips.push(FooterTip::new("ctrl + n first question"));
-            } else {
-                tips.push(FooterTip::new("ctrl + n next question"));
+            if self.has_options() && !self.focus_is_notes() {
+                tips.push(FooterTip::new("←/→ to navigate questions"));
+            } else if !self.has_options() {
+                tips.push(FooterTip::new("ctrl + p / ctrl + n change question"));
             }
         }
-        tips.push(FooterTip::new("esc to interrupt"));
+        if !(self.has_options() && notes_visible) {
+            tips.push(FooterTip::new("esc to interrupt"));
+        }
         tips
     }
 
@@ -662,6 +671,23 @@ impl RequestUserInputOverlay {
         self.sync_composer_placeholder();
     }
 
+    fn clear_notes_and_focus_options(&mut self) {
+        if !self.has_options() {
+            return;
+        }
+        if let Some(answer) = self.current_answer_mut() {
+            answer.draft = ComposerDraft::default();
+            answer.answer_committed = false;
+            answer.notes_visible = false;
+        }
+        self.pending_submission_draft = None;
+        self.composer
+            .set_text_content(String::new(), Vec::new(), Vec::new());
+        self.composer.move_cursor_to_end();
+        self.focus = Focus::Options;
+        self.sync_composer_placeholder();
+    }
+
     /// Ensure there is a selection before allowing notes entry.
     fn ensure_selected_for_notes(&mut self) {
         if let Some(answer) = self.current_answer_mut() {
@@ -722,8 +748,17 @@ impl RequestUserInputOverlay {
         self.app_event_tx
             .send(AppEvent::CodexOp(Op::UserInputAnswer {
                 id: self.request.turn_id.clone(),
-                response: RequestUserInputResponse { answers },
+                response: RequestUserInputResponse {
+                    answers: answers.clone(),
+                },
             }));
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            history_cell::RequestUserInputResultCell {
+                questions: self.request.questions.clone(),
+                answers,
+                interrupted: false,
+            },
+        )));
         if let Some(next) = self.queue.pop_front() {
             self.request = next;
             self.reset_for_request();
@@ -966,6 +1001,12 @@ impl BottomPaneView for RequestUserInputOverlay {
         }
 
         if matches!(key_event.code, KeyCode::Esc) {
+            if self.has_options() && self.notes_ui_visible() {
+                self.clear_notes_and_focus_options();
+                return;
+            }
+            // TODO: Emit interrupted request_user_input results (including committed answers)
+            // once core supports persisting them reliably without follow-up turn issues.
             self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
             self.done = true;
             return;
@@ -1008,7 +1049,23 @@ impl BottomPaneView for RequestUserInputOverlay {
                 return;
             }
             KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.has_options() && matches!(self.focus, Focus::Options) => {
+                self.move_question(false);
+                return;
+            }
+            KeyEvent {
                 code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.has_options() && matches!(self.focus, Focus::Options) => {
+                self.move_question(true);
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Right,
                 modifiers: KeyModifiers::NONE,
                 ..
             } if self.has_options() && matches!(self.focus, Focus::Options) => {
@@ -1081,16 +1138,7 @@ impl BottomPaneView for RequestUserInputOverlay {
             Focus::Notes => {
                 let notes_empty = self.composer.current_text_with_pending().trim().is_empty();
                 if self.has_options() && matches!(key_event.code, KeyCode::Tab) {
-                    if let Some(answer) = self.current_answer_mut() {
-                        answer.draft = ComposerDraft::default();
-                        answer.answer_committed = false;
-                        answer.notes_visible = false;
-                    }
-                    self.composer
-                        .set_text_content(String::new(), Vec::new(), Vec::new());
-                    self.composer.move_cursor_to_end();
-                    self.focus = Focus::Options;
-                    self.sync_composer_placeholder();
+                    self.clear_notes_and_focus_options();
                     return;
                 }
                 if self.has_options() && matches!(key_event.code, KeyCode::Backspace) && notes_empty
@@ -1173,6 +1221,8 @@ impl BottomPaneView for RequestUserInputOverlay {
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.confirm_unanswered_active() {
             self.close_unanswered_confirmation();
+            // TODO: Emit interrupted request_user_input results (including committed answers)
+            // once core supports persisting them reliably without follow-up turn issues.
             self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
             self.done = true;
             return CancellationEvent::Handled;
@@ -1182,6 +1232,8 @@ impl BottomPaneView for RequestUserInputOverlay {
             return CancellationEvent::Handled;
         }
 
+        // TODO: Emit interrupted request_user_input results (including committed answers)
+        // once core supports persisting them reliably without follow-up turn issues.
         self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
         self.done = true;
         CancellationEvent::Handled
@@ -1234,6 +1286,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use std::collections::HashMap;
     use tokio::sync::mpsc::unbounded_channel;
     use unicode_width::UnicodeWidthStr;
 
@@ -1243,6 +1296,18 @@ mod tests {
     ) {
         let (tx_raw, rx) = unbounded_channel::<AppEvent>();
         (AppEventSender::new(tx_raw), rx)
+    }
+
+    fn expect_interrupt_only(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
+        let event = rx.try_recv().expect("expected interrupt AppEvent");
+        let AppEvent::CodexOp(op) = event else {
+            panic!("expected CodexOp");
+        };
+        assert_eq!(op, Op::Interrupt);
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected AppEvents before interrupt completion"
+        );
     }
 
     fn question_with_options(id: &str, header: &str) -> RequestUserInputQuestion {
@@ -1323,6 +1388,57 @@ mod tests {
         }
     }
 
+    fn question_with_very_long_option_text(id: &str, header: &str) -> RequestUserInputQuestion {
+        RequestUserInputQuestion {
+            id: id.to_string(),
+            header: header.to_string(),
+            question: "Choose one option.".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: Some(vec![
+                RequestUserInputQuestionOption {
+                    label: "Job: running/completed/failed/expired; Run/Experiment: succeeded/failed/unknown (Recommended when triaging long-running background work and status transitions)".to_string(),
+                    description: "Keep async job statuses for progress tracking and include enough context for debugging retries, stale workers, and unexpected expiration paths.".to_string(),
+                },
+                RequestUserInputQuestionOption {
+                    label: "Add a short status model".to_string(),
+                    description: "Simpler labels with less detail for quick rollouts.".to_string(),
+                },
+            ]),
+        }
+    }
+
+    fn question_with_long_scroll_options(id: &str, header: &str) -> RequestUserInputQuestion {
+        RequestUserInputQuestion {
+            id: id.to_string(),
+            header: header.to_string(),
+            question:
+                "Choose one option; each hint is intentionally very long to test wrapped scrolling."
+                    .to_string(),
+            is_other: false,
+            is_secret: false,
+            options: Some(vec![
+                RequestUserInputQuestionOption {
+                    label: "Use Detailed Hint A (Recommended)".to_string(),
+                    description: "Select this if you want a deliberately overextended explanatory hint that reads like a miniature specification, including context, rationale, expected behavior, and an explicit statement that this choice is mainly for testing how gracefully the interface wraps, truncates, and preserves readability under unusually verbose helper text conditions.".to_string(),
+                },
+                RequestUserInputQuestionOption {
+                    label: "Use Detailed Hint B".to_string(),
+                    description: "Select this if you want an equally verbose but differently phrased guidance block that emphasizes user-facing clarity, spacing tolerance, multiline wrapping, visual hierarchy interactions, and whether long descriptive metadata remains understandable when scanned quickly in a constrained layout where cognitive load is already high.".to_string(),
+                },
+                RequestUserInputQuestionOption {
+                    label: "Use Detailed Hint C".to_string(),
+                    description: "Select this when you specifically want to verify that navigating downward will keep the currently highlighted option visible, even when previous options consume many wrapped lines and would otherwise push the selection out of the viewport.".to_string(),
+                },
+                RequestUserInputQuestionOption {
+                    label: "None of the above".to_string(),
+                    description:
+                        "Use this only if the previous long-form options do not apply.".to_string(),
+                },
+            ]),
+        }
+    }
+
     fn question_without_options(id: &str, header: &str) -> RequestUserInputQuestion {
         RequestUserInputQuestion {
             id: id.to_string(),
@@ -1390,6 +1506,33 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_discards_queued_requests_and_emits_interrupt() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_with_options("q1", "First")]),
+            tx,
+            true,
+            false,
+            false,
+        );
+        overlay.try_consume_user_input_request(RequestUserInputEvent {
+            call_id: "call-2".to_string(),
+            turn_id: "turn-2".to_string(),
+            questions: vec![question_with_options("q2", "Second")],
+        });
+        overlay.try_consume_user_input_request(RequestUserInputEvent {
+            call_id: "call-3".to_string(),
+            turn_id: "turn-3".to_string(),
+            questions: vec![question_with_options("q3", "Third")],
+        });
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+        assert!(overlay.done, "expected overlay to be done");
+        expect_interrupt_only(&mut rx);
+    }
+
+    #[test]
     fn options_can_submit_empty_when_unanswered() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
@@ -1403,7 +1546,7 @@ mod tests {
         overlay.submit_answers();
 
         let event = rx.try_recv().expect("expected AppEvent");
-        let AppEvent::CodexOp(Op::UserInputAnswer { id, response }) = event else {
+        let AppEvent::CodexOp(Op::UserInputAnswer { id, response, .. }) = event else {
             panic!("expected UserInputAnswer");
         };
         assert_eq!(id, "turn-1");
@@ -1454,15 +1597,30 @@ mod tests {
         let first_answer = &overlay.answers[0];
         assert!(first_answer.answer_committed);
         assert_eq!(first_answer.options_state.selected_idx, Some(0));
-        assert!(rx.try_recv().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected AppEvent before full submission"
+        );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
         let event = rx.try_recv().expect("expected AppEvent");
         let AppEvent::CodexOp(Op::UserInputAnswer { response, .. }) = event else {
             panic!("expected UserInputAnswer");
         };
-        let answer = response.answers.get("q1").expect("answer missing");
-        assert_eq!(answer.answers, vec!["Option 1".to_string()]);
+        let mut expected = HashMap::new();
+        expected.insert(
+            "q1".to_string(),
+            RequestUserInputAnswer {
+                answers: vec!["Option 1".to_string()],
+            },
+        );
+        expected.insert(
+            "q2".to_string(),
+            RequestUserInputAnswer {
+                answers: vec!["Option 1".to_string()],
+            },
+        );
+        assert_eq!(response.answers, expected);
     }
 
     #[test]
@@ -1559,6 +1717,97 @@ mod tests {
     }
 
     #[test]
+    fn left_right_move_between_questions_in_options() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "Pick one"),
+                    question_with_options("q2", "Pick two"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(overlay.current_index(), 0);
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Right));
+        assert_eq!(overlay.current_index(), 1);
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Left));
+        assert_eq!(overlay.current_index(), 0);
+    }
+
+    #[test]
+    fn options_notes_focus_hides_question_navigation_tip() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "Pick one"),
+                    question_with_options("q2", "Pick two"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+        let tips = overlay.footer_tips();
+        let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            tip_texts,
+            vec![
+                "tab to add notes",
+                "enter to submit answer",
+                "←/→ to navigate questions",
+                "esc to interrupt",
+            ]
+        );
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        let tips = overlay.footer_tips();
+        let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            tip_texts,
+            vec!["tab or esc to clear notes", "enter to submit answer",]
+        );
+    }
+
+    #[test]
+    fn freeform_shows_ctrl_p_and_ctrl_n_question_navigation_tip() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "Area"),
+                    question_without_options("q2", "Goal"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+        overlay.move_question(true);
+
+        let tips = overlay.footer_tips();
+        let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            tip_texts,
+            vec![
+                "enter to submit all",
+                "ctrl + p / ctrl + n change question",
+                "esc to interrupt",
+            ]
+        );
+    }
+
+    #[test]
     fn tab_opens_notes_when_option_selected() {
         let (tx, _rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
@@ -1630,6 +1879,10 @@ mod tests {
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert!(overlay.confirm_unanswered_active());
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected AppEvent before confirmation submit"
+        );
         overlay.handle_key_event(KeyEvent::from(KeyCode::Char('1')));
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
@@ -1657,11 +1910,7 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
         assert_eq!(overlay.done, true);
-        let event = rx.try_recv().expect("expected AppEvent");
-        let AppEvent::CodexOp(op) = event else {
-            panic!("expected CodexOp");
-        };
-        assert_eq!(op, Op::Interrupt);
+        expect_interrupt_only(&mut rx);
     }
 
     #[test]
@@ -1678,15 +1927,11 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
         assert_eq!(overlay.done, true);
-        let event = rx.try_recv().expect("expected AppEvent");
-        let AppEvent::CodexOp(op) = event else {
-            panic!("expected CodexOp");
-        };
-        assert_eq!(op, Op::Interrupt);
+        expect_interrupt_only(&mut rx);
     }
 
     #[test]
-    fn esc_in_notes_mode_interrupts() {
+    fn esc_in_notes_mode_clears_notes_and_hides_ui() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
@@ -1697,20 +1942,24 @@ mod tests {
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
+        answer.answer_committed = true;
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Tab));
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
-        assert_eq!(overlay.done, true);
-        let event = rx.try_recv().expect("expected AppEvent");
-        let AppEvent::CodexOp(op) = event else {
-            panic!("expected CodexOp");
-        };
-        assert_eq!(op, Op::Interrupt);
+        let answer = overlay.current_answer().expect("answer missing");
+        assert_eq!(overlay.done, false);
+        assert!(matches!(overlay.focus, Focus::Options));
+        assert_eq!(overlay.notes_ui_visible(), false);
+        assert_eq!(overlay.composer.current_text_with_pending(), "");
+        assert_eq!(answer.draft.text, "");
+        assert_eq!(answer.options_state.selected_idx, Some(0));
+        assert_eq!(answer.answer_committed, false);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn esc_in_notes_mode_interrupts_with_notes_visible() {
+    fn esc_in_notes_mode_with_text_clears_notes_and_hides_ui() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
@@ -1721,17 +1970,49 @@ mod tests {
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
+        answer.answer_committed = true;
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Tab));
         overlay.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
-        assert_eq!(overlay.done, true);
-        let event = rx.try_recv().expect("expected AppEvent");
-        let AppEvent::CodexOp(op) = event else {
-            panic!("expected CodexOp");
-        };
-        assert_eq!(op, Op::Interrupt);
+        let answer = overlay.current_answer().expect("answer missing");
+        assert_eq!(overlay.done, false);
+        assert!(matches!(overlay.focus, Focus::Options));
+        assert_eq!(overlay.notes_ui_visible(), false);
+        assert_eq!(overlay.composer.current_text_with_pending(), "");
+        assert_eq!(answer.draft.text, "");
+        assert_eq!(answer.options_state.selected_idx, Some(0));
+        assert_eq!(answer.answer_committed, false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn esc_drops_committed_answers() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "First"),
+                    question_without_options("q2", "Second"),
+                ],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected AppEvent before interruption"
+        );
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+        expect_interrupt_only(&mut rx);
     }
 
     #[test]
@@ -1961,6 +2242,7 @@ mod tests {
         overlay.composer.move_cursor_to_end();
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_eq!(overlay.answers[0].answer_committed, true);
+        let _ = rx.try_recv();
 
         overlay.move_question(false);
         overlay
@@ -2347,6 +2629,49 @@ mod tests {
         insta::assert_snapshot!(
             "request_user_input_wrapped_options",
             render_snapshot(&overlay, area)
+        );
+    }
+
+    #[test]
+    fn request_user_input_long_option_text_snapshot() {
+        let (tx, _rx) = test_sender();
+        let overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![question_with_very_long_option_text("q1", "Status")],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+        let area = Rect::new(0, 0, 120, 18);
+        insta::assert_snapshot!(
+            "request_user_input_long_option_text",
+            render_snapshot(&overlay, area)
+        );
+    }
+
+    #[test]
+    fn selected_long_wrapped_option_stays_visible() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![question_with_long_scroll_options("q1", "Scroll")],
+            ),
+            tx,
+            true,
+            false,
+            false,
+        );
+        let answer = overlay.current_answer_mut().expect("answer missing");
+        answer.options_state.selected_idx = Some(2);
+
+        let rendered = render_snapshot(&overlay, Rect::new(0, 0, 80, 20));
+        assert!(
+            rendered.contains("› 3. Use Detailed Hint C"),
+            "expected selected option to be visible in viewport\n{rendered}"
         );
     }
 

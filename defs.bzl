@@ -1,7 +1,7 @@
 load("@crates//:data.bzl", "DEP_DATA")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_platform//platform_data:defs.bzl", "platform_data")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
 load("@rules_rust//cargo/private:cargo_build_script_wrapper.bzl", "cargo_build_script")
 
 PLATFORMS = [
@@ -34,9 +34,12 @@ def codex_rust_crate(
         crate_features = [],
         crate_srcs = None,
         crate_edition = None,
+        proc_macro = False,
+        build_script_enabled = True,
         build_script_data = [],
         compile_data = [],
         lib_data_extra = [],
+        rustc_flags_extra = [],
         rustc_env = {},
         deps_extra = [],
         integration_deps_extra = [],
@@ -63,6 +66,7 @@ def codex_rust_crate(
         crate_srcs: Optional explicit srcs; defaults to `src/**/*.rs`.
         crate_edition: Rust edition override, if not default.
             You probably don't want this, it's only here for a single caller.
+        proc_macro: Whether this crate builds a proc-macro library.
         build_script_data: Data files exposed to the build script at runtime.
         compile_data: Non-Rust compile-time data for the library target.
         lib_data_extra: Extra runtime data for the library target.
@@ -95,7 +99,7 @@ def codex_rust_crate(
 
     lib_srcs = crate_srcs or native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
 
-    if native.glob(["build.rs"], allow_empty = True):
+    if build_script_enabled and native.glob(["build.rs"], allow_empty = True):
         cargo_build_script(
             name = name + "-build-script",
             srcs = ["build.rs"],
@@ -109,7 +113,8 @@ def codex_rust_crate(
         deps = deps + [name + "-build-script"]
 
     if lib_srcs:
-        rust_library(
+        lib_rule = rust_proc_macro if proc_macro else rust_library
+        lib_rule(
             name = name,
             crate_name = crate_name,
             crate_features = crate_features,
@@ -119,6 +124,7 @@ def codex_rust_crate(
             data = lib_data_extra,
             srcs = lib_srcs,
             edition = crate_edition,
+            rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
             visibility = ["//visibility:public"],
         )
@@ -129,6 +135,7 @@ def codex_rust_crate(
             env = test_env,
             deps = deps + dev_deps,
             proc_macro_deps = proc_macro_deps + proc_macro_dev_deps,
+            rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
             data = test_data_extra,
             tags = test_tags,
@@ -152,6 +159,7 @@ def codex_rust_crate(
             deps = maybe_lib + deps,
             proc_macro_deps = proc_macro_deps,
             edition = crate_edition,
+            rustc_flags = rustc_flags_extra,
             srcs = native.glob(["src/**/*.rs"]),
             visibility = ["//visibility:public"],
         )
@@ -174,6 +182,7 @@ def codex_rust_crate(
             compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
             deps = maybe_lib + deps + dev_deps + integration_deps_extra,
             proc_macro_deps = proc_macro_deps + proc_macro_dev_deps,
+            rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
             env = test_env | cargo_env,
             tags = test_tags,

@@ -43,19 +43,19 @@ fn permissions_texts(input: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-fn sse_completed(id: &str) -> String {
-    sse(vec![ev_response_created(id), ev_completed(id)])
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_sent_once_on_start() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let req = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -84,11 +84,19 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -136,7 +144,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let permissions_2 = permissions_texts(input2);
 
     assert_eq!(permissions_1.len(), 1);
-    assert_eq!(permissions_2.len(), 3);
+    assert_eq!(permissions_2.len(), 2);
     let unique = permissions_2.into_iter().collect::<HashSet<String>>();
     assert_eq!(unique.len(), 2);
 
@@ -148,11 +156,19 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let test = builder.build(&server).await?;
 
@@ -197,12 +213,24 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let _req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
-    let req3 = mount_sse_once(&server, sse_completed("resp-3")).await;
+    let _req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let _req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let req3 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
     let rollout_path = initial
@@ -267,7 +295,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     let body3 = req3.single_request().body_json();
     let input = body3["input"].as_array().expect("input array");
     let permissions = permissions_texts(input);
-    assert_eq!(permissions.len(), 4);
+    assert_eq!(permissions.len(), 3);
     let unique = permissions.into_iter().collect::<HashSet<String>>();
     assert_eq!(unique.len(), 2);
 
@@ -279,13 +307,29 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let req2 = mount_sse_once(&server, sse_completed("resp-2")).await;
-    let req3 = mount_sse_once(&server, sse_completed("resp-3")).await;
-    let req4 = mount_sse_once(&server, sse_completed("resp-4")).await;
+    let _req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    let req3 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
+    let req4 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
+    )
+    .await;
 
     let mut builder = test_codex().with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
     let rollout_path = initial
@@ -337,10 +381,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
     let permissions_base = permissions_texts(input2);
-    assert_eq!(permissions_base.len(), 3);
+    assert_eq!(permissions_base.len(), 2);
 
     builder = builder.with_config(|config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     });
     let resumed = builder.resume(&server, home, rollout_path.clone()).await?;
     resumed
@@ -366,10 +410,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     assert!(!permissions_base.contains(permissions_resume.last().expect("new permissions")));
 
     let mut fork_config = initial.config.clone();
-    fork_config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+    fork_config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     let forked = initial
         .thread_manager
-        .fork_thread(usize::MAX, fork_config, rollout_path)
+        .fork_thread(usize::MAX, fork_config, rollout_path, false)
         .await?;
     forked
         .thread
@@ -404,11 +448,16 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let req = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let req = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
     let writable = TempDir::new()?;
     let writable_root = AbsolutePathBuf::try_from(writable.path())?;
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![writable_root],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
@@ -416,8 +465,8 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let sandbox_policy_for_config = sandbox_policy.clone();
 
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
     });
     let test = builder.build(&server).await?;
 

@@ -597,6 +597,7 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
                 text: "parent: earlier user message".to_string(),
             }],
             end_turn: None,
+            phase: None,
         };
         let user_json = require_ok(serde_json::to_value(&user), "serialize user response");
         let user_line = serde_json::json!({
@@ -617,6 +618,7 @@ async fn review_input_isolated_from_parent_history_impl(slrv_enabled: bool) {
                 text: "parent: assistant reply".to_string(),
             }],
             end_turn: None,
+            phase: None,
         };
         let assistant_json = require_ok(
             serde_json::to_value(&assistant),

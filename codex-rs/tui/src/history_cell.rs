@@ -37,7 +37,6 @@ use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_line;
 use crate::wrapping::word_wrap_lines;
 use base64::Engine;
-use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
 use codex_core::protocol::FileChange;
@@ -46,18 +45,21 @@ use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::web_search::web_search_detail;
 use codex_otel::RuntimeMetricsSummary;
+use codex_protocol::account::PlanType;
+use codex_protocol::mcp::Resource;
+use codex_protocol::mcp::ResourceTemplate;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::models::local_image_label_text;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::user_input::TextElement;
+use codex_utils_cli::format_env_display::format_env_display;
 use image::DynamicImage;
 use image::ImageReader;
-use mcp_types::EmbeddedResourceResource;
-use mcp_types::Resource;
-use mcp_types::ResourceLink;
-use mcp_types::ResourceTemplate;
 use ratatui::prelude::*;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -167,6 +169,7 @@ pub(crate) struct UserHistoryCell {
     pub text_elements: Vec<TextElement>,
     #[allow(dead_code)]
     pub local_image_paths: Vec<PathBuf>,
+    pub remote_image_urls: Vec<String>,
 }
 
 /// Build logical lines for a user message with styled text elements.
@@ -235,10 +238,22 @@ fn build_user_message_lines_with_elements(
     raw_lines
 }
 
+fn remote_image_display_line(style: Style, index: usize) -> Line<'static> {
+    Line::from(local_image_label_text(index)).style(style)
+}
+
+fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    while lines
+        .last()
+        .is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
+    {
+        lines.pop();
+    }
+    lines
+}
+
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-
         let wrap_width = width
             .saturating_sub(
                 LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
@@ -248,13 +263,35 @@ impl HistoryCell for UserHistoryCell {
         let style = user_message_style();
         let element_style = style.fg(Color::Cyan);
 
-        let wrapped = if self.text_elements.is_empty() {
-            word_wrap_lines(
-                self.message.split('\n').map(|l| Line::from(l).style(style)),
+        let wrapped_remote_images = if self.remote_image_urls.is_empty() {
+            None
+        } else {
+            Some(word_wrap_lines(
+                self.remote_image_urls
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _url)| {
+                        remote_image_display_line(element_style, idx.saturating_add(1))
+                    }),
+                RtOptions::new(usize::from(wrap_width))
+                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+            ))
+        };
+
+        let wrapped_message = if self.message.is_empty() && self.text_elements.is_empty() {
+            None
+        } else if self.text_elements.is_empty() {
+            let message_without_trailing_newlines = self.message.trim_end_matches(['\r', '\n']);
+            let wrapped = word_wrap_lines(
+                message_without_trailing_newlines
+                    .split('\n')
+                    .map(|line| Line::from(line).style(style)),
                 // Wrap algorithm matches textarea.rs.
                 RtOptions::new(usize::from(wrap_width))
                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-            )
+            );
+            let wrapped = trim_trailing_blank_lines(wrapped);
+            (!wrapped.is_empty()).then_some(wrapped)
         } else {
             let raw_lines = build_user_message_lines_with_elements(
                 &self.message,
@@ -262,17 +299,56 @@ impl HistoryCell for UserHistoryCell {
                 style,
                 element_style,
             );
-            word_wrap_lines(
+            let wrapped = word_wrap_lines(
                 raw_lines,
                 RtOptions::new(usize::from(wrap_width))
                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-            )
+            );
+            let wrapped = trim_trailing_blank_lines(wrapped);
+            (!wrapped.is_empty()).then_some(wrapped)
         };
 
-        lines.push(Line::from("").style(style));
-        lines.extend(prefix_lines(wrapped, "› ".bold().dim(), "  ".into()));
+        if wrapped_remote_images.is_none() && wrapped_message.is_none() {
+            return Vec::new();
+        }
+
+        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
+
+        if let Some(wrapped_remote_images) = wrapped_remote_images {
+            lines.extend(prefix_lines(
+                wrapped_remote_images,
+                "  ".into(),
+                "  ".into(),
+            ));
+            if wrapped_message.is_some() {
+                lines.push(Line::from("").style(style));
+            }
+        }
+
+        if let Some(wrapped_message) = wrapped_message {
+            lines.extend(prefix_lines(
+                wrapped_message,
+                "› ".bold().dim(),
+                "  ".into(),
+            ));
+        }
+
         lines.push(Line::from("").style(style));
         lines
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width)
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX)
+    }
+
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        self.display_lines(width)
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 }
 
@@ -943,6 +1019,7 @@ pub(crate) fn new_session_info(
     requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
+    auth_plan: Option<PlanType>,
 ) -> SessionInfoCell {
     let SessionConfiguredEvent {
         model,
@@ -995,7 +1072,7 @@ pub(crate) fn new_session_info(
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
         if config.show_tooltips
-            && let Some(tooltips) = tooltips::random_tooltip().map(TooltipHistoryCell::new)
+            && let Some(tooltips) = tooltips::get_tooltip(auth_plan).map(TooltipHistoryCell::new)
         {
             parts.push(Box::new(tooltips));
         }
@@ -1016,11 +1093,13 @@ pub(crate) fn new_user_prompt(
     message: String,
     text_elements: Vec<TextElement>,
     local_image_paths: Vec<PathBuf>,
+    remote_image_urls: Vec<String>,
 ) -> UserHistoryCell {
     UserHistoryCell {
         message,
         text_elements,
         local_image_paths,
+        remote_image_urls,
     }
 }
 
@@ -1199,7 +1278,7 @@ pub(crate) struct McpToolCallCell {
     invocation: McpInvocation,
     start_time: Instant,
     duration: Option<Duration>,
-    result: Option<Result<mcp_types::CallToolResult, String>>,
+    result: Option<Result<codex_protocol::mcp::CallToolResult, String>>,
     animations_enabled: bool,
 }
 
@@ -1226,7 +1305,7 @@ impl McpToolCallCell {
     pub(crate) fn complete(
         &mut self,
         duration: Duration,
-        result: Result<mcp_types::CallToolResult, String>,
+        result: Result<codex_protocol::mcp::CallToolResult, String>,
     ) -> Option<Box<dyn HistoryCell>> {
         let image_cell = try_new_completed_mcp_tool_call_with_image_output(&result)
             .map(|cell| Box::new(cell) as Box<dyn HistoryCell>);
@@ -1249,23 +1328,32 @@ impl McpToolCallCell {
         self.result = Some(Err("interrupted".to_string()));
     }
 
-    fn render_content_block(block: &mcp_types::ContentBlock, width: usize) -> String {
-        match block {
-            mcp_types::ContentBlock::TextContent(text) => {
+    fn render_content_block(block: &serde_json::Value, width: usize) -> String {
+        let content = match serde_json::from_value::<rmcp::model::Content>(block.clone()) {
+            Ok(content) => content,
+            Err(_) => {
+                return format_and_truncate_tool_result(
+                    &block.to_string(),
+                    TOOL_CALL_MAX_LINES,
+                    width,
+                );
+            }
+        };
+
+        match content.raw {
+            rmcp::model::RawContent::Text(text) => {
                 format_and_truncate_tool_result(&text.text, TOOL_CALL_MAX_LINES, width)
             }
-            mcp_types::ContentBlock::ImageContent(_) => "<image content>".to_string(),
-            mcp_types::ContentBlock::AudioContent(_) => "<audio content>".to_string(),
-            mcp_types::ContentBlock::EmbeddedResource(resource) => {
-                let uri = match &resource.resource {
-                    EmbeddedResourceResource::TextResourceContents(text) => text.uri.clone(),
-                    EmbeddedResourceResource::BlobResourceContents(blob) => blob.uri.clone(),
+            rmcp::model::RawContent::Image(_) => "<image content>".to_string(),
+            rmcp::model::RawContent::Audio(_) => "<audio content>".to_string(),
+            rmcp::model::RawContent::Resource(resource) => {
+                let uri = match resource.resource {
+                    rmcp::model::ResourceContents::TextResourceContents { uri, .. } => uri,
+                    rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => uri,
                 };
                 format!("embedded resource: {uri}")
             }
-            mcp_types::ContentBlock::ResourceLink(ResourceLink { uri, .. }) => {
-                format!("link: {uri}")
-            }
+            rmcp::model::RawContent::ResourceLink(link) => format!("link: {}", link.uri),
         }
     }
 }
@@ -1314,7 +1402,7 @@ impl HistoryCell for McpToolCallCell {
 
         if let Some(result) = &self.result {
             match result {
-                Ok(mcp_types::CallToolResult { content, .. }) => {
+                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
                     if !content.is_empty() {
                         for block in content {
                             let text = Self::render_content_block(block, detail_wrap_width);
@@ -1475,7 +1563,7 @@ pub(crate) fn new_web_search_call(
 ///   `invalid_base64_then_image`, or `invalid_image_bytes_then_image` to ensure this path triggers
 ///   even when the first block is not a valid image.
 fn try_new_completed_mcp_tool_call_with_image_output(
-    result: &Result<mcp_types::CallToolResult, String>,
+    result: &Result<codex_protocol::mcp::CallToolResult, String>,
 ) -> Option<CompletedMcpToolCallWithImageOutput> {
     let image = result
         .as_ref()
@@ -1491,13 +1579,18 @@ fn try_new_completed_mcp_tool_call_with_image_output(
 ///
 /// Returns `None` when the block is not an image, when base64 decoding fails, when the format
 /// cannot be inferred, or when the image decoder rejects the bytes.
-fn decode_mcp_image(block: &mcp_types::ContentBlock) -> Option<DynamicImage> {
-    let image = match block {
-        mcp_types::ContentBlock::ImageContent(image) => image,
-        _ => return None,
+fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
+    let content = serde_json::from_value::<rmcp::model::Content>(block.clone()).ok()?;
+    let rmcp::model::RawContent::Image(image) = content.raw else {
+        return None;
+    };
+    let base64_data = if let Some(data_url) = image.data.strip_prefix("data:") {
+        data_url.split_once(',')?.1
+    } else {
+        image.data.as_str()
     };
     let raw_data = base64::engine::general_purpose::STANDARD
-        .decode(&image.data)
+        .decode(base64_data)
         .map_err(|e| {
             error!("Failed to decode image data: {e}");
             e
@@ -1580,7 +1673,7 @@ pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
 /// Render MCP tools grouped by connection using the fully-qualified tool names.
 pub(crate) fn new_mcp_tools_output(
     config: &Config,
-    tools: HashMap<String, mcp_types::Tool>,
+    tools: HashMap<String, codex_protocol::mcp::Tool>,
     resources: HashMap<String, Vec<Resource>>,
     resource_templates: HashMap<String, Vec<ResourceTemplate>>,
     auth_statuses: &HashMap<String, McpAuthStatus>,
@@ -1758,6 +1851,151 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     // in terminals like Ghostty.
     let lines: Vec<Line<'static>> = vec![vec![format!("■ {message}").red()].into()];
     PlainHistoryCell { lines }
+}
+
+/// Renders a completed (or interrupted) request_user_input exchange in history.
+#[derive(Debug)]
+pub(crate) struct RequestUserInputResultCell {
+    pub(crate) questions: Vec<RequestUserInputQuestion>,
+    pub(crate) answers: HashMap<String, RequestUserInputAnswer>,
+    pub(crate) interrupted: bool,
+}
+
+impl HistoryCell for RequestUserInputResultCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1) as usize;
+        let total = self.questions.len();
+        let answered = self
+            .questions
+            .iter()
+            .filter(|question| {
+                self.answers
+                    .get(&question.id)
+                    .is_some_and(|answer| !answer.answers.is_empty())
+            })
+            .count();
+        let unanswered = total.saturating_sub(answered);
+
+        let mut header = vec!["•".dim(), " ".into(), "Questions".bold()];
+        header.push(format!(" {answered}/{total} answered").dim());
+        if self.interrupted {
+            header.push(" (interrupted)".cyan());
+        }
+
+        let mut lines: Vec<Line<'static>> = vec![header.into()];
+
+        for question in &self.questions {
+            let answer = self.answers.get(&question.id);
+            let answer_missing = match answer {
+                Some(answer) => answer.answers.is_empty(),
+                None => true,
+            };
+            let mut question_lines = wrap_with_prefix(
+                &question.question,
+                width,
+                "  • ".into(),
+                "    ".into(),
+                Style::default(),
+            );
+            if answer_missing && let Some(last) = question_lines.last_mut() {
+                last.spans.push(" (unanswered)".dim());
+            }
+            lines.extend(question_lines);
+
+            let Some(answer) = answer.filter(|answer| !answer.answers.is_empty()) else {
+                continue;
+            };
+            if question.is_secret {
+                lines.extend(wrap_with_prefix(
+                    "••••••",
+                    width,
+                    "    answer: ".dim(),
+                    "            ".dim(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                continue;
+            }
+
+            let (options, note) = split_request_user_input_answer(answer);
+
+            for option in options {
+                lines.extend(wrap_with_prefix(
+                    &option,
+                    width,
+                    "    answer: ".dim(),
+                    "            ".dim(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            if let Some(note) = note {
+                let (label, continuation, style) = if question.options.is_some() {
+                    (
+                        "    note: ".dim(),
+                        "          ".dim(),
+                        Style::default().fg(Color::Cyan),
+                    )
+                } else {
+                    (
+                        "    answer: ".dim(),
+                        "            ".dim(),
+                        Style::default().fg(Color::Cyan),
+                    )
+                };
+                lines.extend(wrap_with_prefix(&note, width, label, continuation, style));
+            }
+        }
+
+        if self.interrupted && unanswered > 0 {
+            let summary = format!("interrupted with {unanswered} unanswered");
+            lines.extend(wrap_with_prefix(
+                &summary,
+                width,
+                "  ↳ ".cyan().dim(),
+                "    ".dim(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ));
+        }
+
+        lines
+    }
+}
+
+/// Wrap a plain string with textwrap and prefix each line, while applying a style to the content.
+fn wrap_with_prefix(
+    text: &str,
+    width: usize,
+    initial_prefix: Span<'static>,
+    subsequent_prefix: Span<'static>,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let prefix_width = initial_prefix
+        .content
+        .width()
+        .max(subsequent_prefix.content.width());
+    let wrap_width = width.saturating_sub(prefix_width).max(1);
+    let wrapped = textwrap::wrap(text, wrap_width);
+    let wrapped_lines = wrapped
+        .into_iter()
+        .map(|segment| Span::from(segment.to_string()).set_style(style).into())
+        .collect::<Vec<Line<'static>>>();
+    prefix_lines(wrapped_lines, initial_prefix, subsequent_prefix)
+}
+
+/// Split a request_user_input answer into option labels and an optional freeform note.
+/// Notes are encoded as "user_note: <text>" entries in the answers list.
+fn split_request_user_input_answer(
+    answer: &RequestUserInputAnswer,
+) -> (Vec<String>, Option<String>) {
+    let mut options = Vec::new();
+    let mut note = None;
+    for entry in &answer.answers {
+        if let Some(note_text) = entry.strip_prefix("user_note: ") {
+            note = Some(note_text.to_string());
+        } else {
+            options.push(entry.clone());
+        }
+    }
+    (options, note)
 }
 
 /// Render a user‑friendly plan update styled like a checkbox todo list.
@@ -1986,6 +2224,7 @@ impl HistoryCell for FinalMessageSeparator {
         let mut label_parts = Vec::new();
         if let Some(elapsed_seconds) = self
             .elapsed_seconds
+            .filter(|seconds| *seconds > 60)
             .map(super::status_indicator_widget::fmt_elapsed_compact)
         {
             label_parts.push(format!("Worked for {elapsed_seconds}"));
@@ -2010,7 +2249,7 @@ impl HistoryCell for FinalMessageSeparator {
     }
 }
 
-fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
+pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
     let mut parts = Vec::new();
     if summary.tool_calls.count > 0 {
         let duration = format_duration_ms(summary.tool_calls.duration_ms);
@@ -2050,6 +2289,42 @@ fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
             "{} events received ({duration})",
             summary.websocket_events.count
         ));
+    }
+    if summary.responses_api_overhead_ms > 0 {
+        let duration = format_duration_ms(summary.responses_api_overhead_ms);
+        parts.push(format!("Responses API overhead: {duration}"));
+    }
+    if summary.responses_api_inference_time_ms > 0 {
+        let duration = format_duration_ms(summary.responses_api_inference_time_ms);
+        parts.push(format!("Responses API inference: {duration}"));
+    }
+    if summary.responses_api_engine_iapi_ttft_ms > 0
+        || summary.responses_api_engine_service_ttft_ms > 0
+    {
+        let mut ttft_parts = Vec::new();
+        if summary.responses_api_engine_iapi_ttft_ms > 0 {
+            let duration = format_duration_ms(summary.responses_api_engine_iapi_ttft_ms);
+            ttft_parts.push(format!("{duration} (iapi)"));
+        }
+        if summary.responses_api_engine_service_ttft_ms > 0 {
+            let duration = format_duration_ms(summary.responses_api_engine_service_ttft_ms);
+            ttft_parts.push(format!("{duration} (service)"));
+        }
+        parts.push(format!("TTFT: {}", ttft_parts.join(" ")));
+    }
+    if summary.responses_api_engine_iapi_tbt_ms > 0
+        || summary.responses_api_engine_service_tbt_ms > 0
+    {
+        let mut tbt_parts = Vec::new();
+        if summary.responses_api_engine_iapi_tbt_ms > 0 {
+            let duration = format_duration_ms(summary.responses_api_engine_iapi_tbt_ms);
+            tbt_parts.push(format!("{duration} (iapi)"));
+        }
+        if summary.responses_api_engine_service_tbt_ms > 0 {
+            let duration = format_duration_ms(summary.responses_api_engine_service_tbt_ms);
+            tbt_parts.push(format!("{duration} (service)"));
+        }
+        parts.push(format!("TBT: {}", tbt_parts.join(" ")));
     }
     if parts.is_empty() {
         None
@@ -2113,12 +2388,9 @@ mod tests {
     use std::collections::HashMap;
 
     use codex_core::protocol::ExecCommandSource;
-    use mcp_types::CallToolResult;
-    use mcp_types::ContentBlock;
-    use mcp_types::ImageContent;
-    use mcp_types::TextContent;
-    use mcp_types::Tool;
-    use mcp_types::ToolInputSchema;
+    use codex_protocol::mcp::CallToolResult;
+    use codex_protocol::mcp::Tool;
+    use rmcp::model::Content;
 
     const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     async fn test_config() -> Config {
@@ -2146,13 +2418,32 @@ mod tests {
         render_lines(&cell.transcript_lines(u16::MAX))
     }
 
-    fn image_block(data: &str) -> ContentBlock {
-        ContentBlock::ImageContent(ImageContent {
-            annotations: None,
-            data: data.to_string(),
-            mime_type: "image/png".into(),
-            r#type: "image".into(),
-        })
+    fn image_block(data: &str) -> serde_json::Value {
+        serde_json::to_value(Content::image(data.to_string(), "image/png"))
+            .expect("image content should serialize")
+    }
+
+    fn text_block(text: &str) -> serde_json::Value {
+        serde_json::to_value(Content::text(text)).expect("text content should serialize")
+    }
+
+    fn resource_link_block(
+        uri: &str,
+        name: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::to_value(Content::resource_link(rmcp::model::RawResource {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            title: title.map(str::to_string),
+            description: description.map(str::to_string),
+            mime_type: None,
+            size: None,
+            icons: None,
+            meta: None,
+        }))
+        .expect("resource link content should serialize")
     }
 
     #[test]
@@ -2181,7 +2472,7 @@ mod tests {
     }
 
     #[test]
-    fn final_message_separator_includes_runtime_metrics() {
+    fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics() {
         let summary = RuntimeMetricsSummary {
             tool_calls: RuntimeMetricTotals {
                 count: 3,
@@ -2203,17 +2494,36 @@ mod tests {
                 count: 4,
                 duration_ms: 1_200,
             },
+            responses_api_overhead_ms: 650,
+            responses_api_inference_time_ms: 1_940,
+            responses_api_engine_iapi_ttft_ms: 410,
+            responses_api_engine_service_ttft_ms: 460,
+            responses_api_engine_iapi_tbt_ms: 1_180,
+            responses_api_engine_service_tbt_ms: 1_240,
         };
         let cell = FinalMessageSeparator::new(Some(12), Some(summary));
-        let rendered = render_lines(&cell.display_lines(200));
+        let rendered = render_lines(&cell.display_lines(600));
 
         assert_eq!(rendered.len(), 1);
-        assert!(rendered[0].contains("Worked for 12s"));
+        assert!(!rendered[0].contains("Worked for"));
         assert!(rendered[0].contains("Local tools: 3 calls (2.5s)"));
         assert!(rendered[0].contains("Inference: 2 calls (1.2s)"));
         assert!(rendered[0].contains("WebSocket: 1 events send (700ms)"));
         assert!(rendered[0].contains("Streams: 6 events (900ms)"));
         assert!(rendered[0].contains("4 events received (1.2s)"));
+        assert!(rendered[0].contains("Responses API overhead: 650ms"));
+        assert!(rendered[0].contains("Responses API inference: 1.9s"));
+        assert!(rendered[0].contains("TTFT: 410ms (iapi) 460ms (service)"));
+        assert!(rendered[0].contains("TBT: 1.2s (iapi) 1.2s (service)"));
+    }
+
+    #[test]
+    fn final_message_separator_includes_worked_label_after_one_minute() {
+        let cell = FinalMessageSeparator::new(Some(61), None);
+        let rendered = render_lines(&cell.display_lines(200));
+
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("Worked for"));
     }
 
     #[test]
@@ -2292,6 +2602,7 @@ mod tests {
                 cwd: None,
             },
             enabled: true,
+            required: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -2314,6 +2625,7 @@ mod tests {
                 env_http_headers: Some(env_headers),
             },
             enabled: true,
+            required: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -2331,31 +2643,27 @@ mod tests {
         tools.insert(
             "mcp__docs__list".to_string(),
             Tool {
-                annotations: None,
                 description: None,
-                input_schema: ToolInputSchema {
-                    properties: None,
-                    required: None,
-                    r#type: "object".to_string(),
-                },
                 name: "list".to_string(),
-                output_schema: None,
                 title: None,
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
             },
         );
         tools.insert(
             "mcp__http__ping".to_string(),
             Tool {
-                annotations: None,
                 description: None,
-                input_schema: ToolInputSchema {
-                    properties: None,
-                    required: None,
-                    r#type: "object".to_string(),
-                },
                 name: "ping".to_string(),
-                output_schema: None,
                 title: None,
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
             },
         );
 
@@ -2504,13 +2812,10 @@ mod tests {
         };
 
         let result = CallToolResult {
-            content: vec![ContentBlock::TextContent(TextContent {
-                annotations: None,
-                text: "Found styling guidance in styles.md".into(),
-                r#type: "text".into(),
-            })],
+            content: vec![text_block("Found styling guidance in styles.md")],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-2".into(), invocation, true);
@@ -2536,18 +2841,42 @@ mod tests {
 
         let result = CallToolResult {
             content: vec![
-                ContentBlock::TextContent(TextContent {
-                    annotations: None,
-                    text: "Here is the image:".into(),
-                    r#type: "text".into(),
-                }),
+                text_block("Here is the image:"),
                 image_block(SMALL_PNG_BASE64),
             ],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-image".into(), invocation, true);
+        let extra_cell = cell
+            .complete(Duration::from_millis(25), Ok(result))
+            .expect("expected image cell");
+
+        let rendered = render_lines(&extra_cell.display_lines(80));
+        assert_eq!(rendered, vec!["tool result (image output)"]);
+    }
+
+    #[test]
+    fn completed_mcp_tool_call_accepts_data_url_image_blocks() {
+        let invocation = McpInvocation {
+            server: "image".into(),
+            tool: "generate".into(),
+            arguments: Some(json!({
+                "prompt": "tiny image",
+            })),
+        };
+
+        let data_url = format!("data:image/png;base64,{SMALL_PNG_BASE64}");
+        let result = CallToolResult {
+            content: vec![image_block(&data_url)],
+            is_error: None,
+            structured_content: None,
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-image-data-url".into(), invocation, true);
         let extra_cell = cell
             .complete(Duration::from_millis(25), Ok(result))
             .expect("expected image cell");
@@ -2570,6 +2899,7 @@ mod tests {
             content: vec![image_block("not-base64"), image_block(SMALL_PNG_BASE64)],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-image-2".into(), invocation, true);
@@ -2616,24 +2946,19 @@ mod tests {
 
         let result = CallToolResult {
             content: vec![
-                ContentBlock::TextContent(TextContent {
-                    annotations: None,
-                    text: "Found styling guidance in styles.md and additional notes in CONTRIBUTING.md.".into(),
-                    r#type: "text".into(),
-                }),
-                ContentBlock::ResourceLink(ResourceLink {
-                    annotations: None,
-                    description: Some("Link to styles documentation".into()),
-                    mime_type: None,
-                    name: "styles.md".into(),
-                    size: None,
-                    title: Some("Styles".into()),
-                    r#type: "resource_link".into(),
-                    uri: "file:///docs/styles.md".into(),
-                }),
+                text_block(
+                    "Found styling guidance in styles.md and additional notes in CONTRIBUTING.md.",
+                ),
+                resource_link_block(
+                    "file:///docs/styles.md",
+                    "styles.md",
+                    Some("Styles"),
+                    Some("Link to styles documentation"),
+                ),
             ],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-4".into(), invocation, true);
@@ -2659,13 +2984,12 @@ mod tests {
         };
 
         let result = CallToolResult {
-            content: vec![ContentBlock::TextContent(TextContent {
-                annotations: None,
-                text: "Line one of the response, which is quite long and needs wrapping.\nLine two continues the response with more detail.".into(),
-                r#type: "text".into(),
-            })],
+            content: vec![text_block(
+                "Line one of the response, which is quite long and needs wrapping.\nLine two continues the response with more detail.",
+            )],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-5".into(), invocation, true);
@@ -2692,19 +3016,12 @@ mod tests {
 
         let result = CallToolResult {
             content: vec![
-                ContentBlock::TextContent(TextContent {
-                    annotations: None,
-                    text: "Latency summary: p50=120ms, p95=480ms.".into(),
-                    r#type: "text".into(),
-                }),
-                ContentBlock::TextContent(TextContent {
-                    annotations: None,
-                    text: "No anomalies detected.".into(),
-                    r#type: "text".into(),
-                }),
+                text_block("Latency summary: p50=120ms, p95=480ms."),
+                text_block("No anomalies detected."),
             ],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
 
         let mut cell = new_active_mcp_tool_call("call-6".into(), invocation, true);
@@ -3119,6 +3436,7 @@ mod tests {
             message: msg.to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
         };
 
         // Small width to force wrapping more clearly. Effective wrap width is width-2 due to the ▌ prefix and trailing space.
@@ -3127,6 +3445,120 @@ mod tests {
         let rendered = render_lines(&lines).join("\n");
 
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn user_history_cell_renders_remote_image_urls() {
+        let cell = UserHistoryCell {
+            message: "describe these".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec!["https://example.com/example.png".to_string()],
+        };
+
+        let rendered = render_lines(&cell.display_lines(80)).join("\n");
+
+        assert!(rendered.contains("[Image #1]"));
+        assert!(rendered.contains("describe these"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn user_history_cell_summarizes_inline_data_urls() {
+        let cell = UserHistoryCell {
+            message: "describe inline image".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec!["data:image/png;base64,aGVsbG8=".to_string()],
+        };
+
+        let rendered = render_lines(&cell.display_lines(80)).join("\n");
+
+        assert!(rendered.contains("[Image #1]"));
+        assert!(rendered.contains("describe inline image"));
+    }
+
+    #[test]
+    fn user_history_cell_numbers_multiple_remote_images() {
+        let cell = UserHistoryCell {
+            message: "describe both".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![
+                "https://example.com/one.png".to_string(),
+                "https://example.com/two.png".to_string(),
+            ],
+        };
+
+        let rendered = render_lines(&cell.display_lines(80)).join("\n");
+
+        assert!(rendered.contains("[Image #1]"));
+        assert!(rendered.contains("[Image #2]"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn user_history_cell_height_matches_rendered_lines_with_remote_images() {
+        let cell = UserHistoryCell {
+            message: "line one\nline two".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![
+                "https://example.com/one.png".to_string(),
+                "https://example.com/two.png".to_string(),
+            ],
+        };
+
+        let width = 80;
+        let rendered_len: u16 = cell
+            .display_lines(width)
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX);
+        assert_eq!(cell.desired_height(width), rendered_len);
+        assert_eq!(cell.desired_transcript_height(width), rendered_len);
+    }
+
+    #[test]
+    fn user_history_cell_trims_trailing_blank_message_lines() {
+        let cell = UserHistoryCell {
+            message: "line one\n\n   \n\t \n".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec!["https://example.com/one.png".to_string()],
+        };
+
+        let rendered = render_lines(&cell.display_lines(80));
+        let trailing_blank_count = rendered
+            .iter()
+            .rev()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+        assert_eq!(trailing_blank_count, 1);
+        assert!(rendered.iter().any(|line| line.contains("line one")));
+    }
+
+    #[test]
+    fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
+        let message = "tokenized\n\n\n".to_string();
+        let cell = UserHistoryCell {
+            message,
+            text_elements: vec![TextElement::new(
+                (0..8).into(),
+                Some("tokenized".to_string()),
+            )],
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec!["https://example.com/one.png".to_string()],
+        };
+
+        let rendered = render_lines(&cell.display_lines(80));
+        let trailing_blank_count = rendered
+            .iter()
+            .rev()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+        assert_eq!(trailing_blank_count, 1);
+        assert!(rendered.iter().any(|line| line.contains("tokenized")));
     }
 
     #[test]

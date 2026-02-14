@@ -1,6 +1,5 @@
 pub mod auth;
 mod skill_dependencies;
-
 pub(crate) use skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
 
 use std::collections::HashMap;
@@ -9,9 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_channel::unbounded;
+use codex_protocol::mcp::Resource;
+use codex_protocol::mcp::ResourceTemplate;
+use codex_protocol::mcp::Tool;
 use codex_protocol::protocol::McpListToolsResponseEvent;
 use codex_protocol::protocol::SandboxPolicy;
-use mcp_types::Tool as McpTool;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::AuthManager;
@@ -28,6 +30,15 @@ const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 pub(crate) const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
+const OPENAI_CONNECTORS_MCP_BASE_URL: &str = "https://api.openai.com";
+const OPENAI_CONNECTORS_MCP_PATH: &str = "/v1/connectors/mcp/";
+
+// Legacy vs new MCP gateway
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAppsMcpGateway {
+    LegacyMCPGateway,
+    MCPGateway,
+}
 
 fn codex_apps_mcp_bearer_token_env_var() -> Option<String> {
     match env::var(CODEX_CONNECTORS_TOKEN_ENV_VAR) {
@@ -63,7 +74,15 @@ fn codex_apps_mcp_http_headers(auth: Option<&CodexAuth>) -> Option<HashMap<Strin
     }
 }
 
-fn codex_apps_mcp_url(base_url: &str) -> String {
+fn selected_config_codex_apps_mcp_gateway(config: &Config) -> CodexAppsMcpGateway {
+    if config.features.enabled(Feature::AppsMcpGateway) {
+        CodexAppsMcpGateway::MCPGateway
+    } else {
+        CodexAppsMcpGateway::LegacyMCPGateway
+    }
+}
+
+fn normalize_codex_apps_base_url(base_url: &str) -> String {
     let mut base_url = base_url.trim_end_matches('/').to_string();
     if (base_url.starts_with("https://chatgpt.com")
         || base_url.starts_with("https://chat.openai.com"))
@@ -71,6 +90,15 @@ fn codex_apps_mcp_url(base_url: &str) -> String {
     {
         base_url = format!("{base_url}/backend-api");
     }
+    base_url
+}
+
+fn codex_apps_mcp_url_for_gateway(base_url: &str, gateway: CodexAppsMcpGateway) -> String {
+    if gateway == CodexAppsMcpGateway::MCPGateway {
+        return format!("{OPENAI_CONNECTORS_MCP_BASE_URL}{OPENAI_CONNECTORS_MCP_PATH}");
+    }
+
+    let base_url = normalize_codex_apps_base_url(base_url);
     if base_url.contains("/backend-api") {
         format!("{base_url}/wham/apps")
     } else if base_url.contains("/api/codex") {
@@ -80,6 +108,13 @@ fn codex_apps_mcp_url(base_url: &str) -> String {
     }
 }
 
+pub(crate) fn codex_apps_mcp_url(config: &Config) -> String {
+    codex_apps_mcp_url_for_gateway(
+        &config.chatgpt_base_url,
+        selected_config_codex_apps_mcp_gateway(config),
+    )
+}
+
 fn codex_apps_mcp_server_config(config: &Config, auth: Option<&CodexAuth>) -> McpServerConfig {
     let bearer_token_env_var = codex_apps_mcp_bearer_token_env_var();
     let http_headers = if bearer_token_env_var.is_some() {
@@ -87,7 +122,7 @@ fn codex_apps_mcp_server_config(config: &Config, auth: Option<&CodexAuth>) -> Mc
     } else {
         codex_apps_mcp_http_headers(auth)
     };
-    let url = codex_apps_mcp_url(&config.chatgpt_base_url);
+    let url = codex_apps_mcp_url(config);
 
     McpServerConfig {
         transport: McpServerTransportConfig::StreamableHttp {
@@ -97,6 +132,7 @@ fn codex_apps_mcp_server_config(config: &Config, auth: Option<&CodexAuth>) -> Mc
             env_http_headers: None,
         },
         enabled: true,
+        required: false,
         disabled_reason: None,
         startup_timeout_sec: Some(Duration::from_secs(30)),
         tool_timeout_sec: None,
@@ -162,9 +198,10 @@ pub async fn collect_mcp_snapshot(config: &Config) -> McpListToolsResponseEvent 
 
     // Use ReadOnly sandbox policy for MCP snapshot collection (safest default)
     let sandbox_state = SandboxState {
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
         sandbox_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        use_linux_sandbox_bwrap: config.features.enabled(Feature::UseLinuxSandboxBwrap),
     };
 
     mcp_connection_manager
@@ -201,8 +238,8 @@ pub fn split_qualified_tool_name(qualified_name: &str) -> Option<(String, String
 }
 
 pub fn group_tools_by_server(
-    tools: &HashMap<String, McpTool>,
-) -> HashMap<String, HashMap<String, McpTool>> {
+    tools: &HashMap<String, Tool>,
+) -> HashMap<String, HashMap<String, Tool>> {
     let mut grouped = HashMap::new();
     for (qualified_name, tool) in tools {
         if let Some((server_name, tool_name)) = split_qualified_tool_name(qualified_name) {
@@ -230,11 +267,96 @@ pub(crate) async fn collect_mcp_snapshot_from_manager(
         .map(|(name, entry)| (name.clone(), entry.auth_status))
         .collect();
 
+    let tools = tools
+        .into_iter()
+        .filter_map(|(name, tool)| match serde_json::to_value(tool.tool) {
+            Ok(value) => match Tool::from_mcp_value(value) {
+                Ok(tool) => Some((name, tool)),
+                Err(err) => {
+                    tracing::warn!("Failed to convert MCP tool '{name}': {err}");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::warn!("Failed to serialize MCP tool '{name}': {err}");
+                None
+            }
+        })
+        .collect();
+
+    let resources = resources
+        .into_iter()
+        .map(|(name, resources)| {
+            let resources = resources
+                .into_iter()
+                .filter_map(|resource| match serde_json::to_value(resource) {
+                    Ok(value) => match Resource::from_mcp_value(value.clone()) {
+                        Ok(resource) => Some(resource),
+                        Err(err) => {
+                            let (uri, resource_name) = match value {
+                                Value::Object(obj) => (
+                                    obj.get("uri")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                    obj.get("name")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                ),
+                                _ => (None, None),
+                            };
+
+                            tracing::warn!(
+                                "Failed to convert MCP resource (uri={uri:?}, name={resource_name:?}): {err}"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to serialize MCP resource: {err}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            (name, resources)
+        })
+        .collect();
+
+    let resource_templates = resource_templates
+        .into_iter()
+        .map(|(name, templates)| {
+            let templates = templates
+                .into_iter()
+                .filter_map(|template| match serde_json::to_value(template) {
+                    Ok(value) => match ResourceTemplate::from_mcp_value(value.clone()) {
+                        Ok(template) => Some(template),
+                        Err(err) => {
+                            let (uri_template, template_name) = match value {
+                                Value::Object(obj) => (
+                                    obj.get("uriTemplate")
+                                        .or_else(|| obj.get("uri_template"))
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                    obj.get("name")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                ),
+                                _ => (None, None),
+                            };
+
+                            tracing::warn!(
+                                "Failed to convert MCP resource template (uri_template={uri_template:?}, name={template_name:?}): {err}"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to serialize MCP resource template: {err}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            (name, templates)
+        })
+        .collect();
+
     McpListToolsResponseEvent {
-        tools: tools
-            .into_iter()
-            .map(|(name, tool)| (name, tool.tool))
-            .collect(),
+        tools,
         resources,
         resource_templates,
         auth_statuses,
@@ -244,21 +366,18 @@ pub(crate) async fn collect_mcp_snapshot_from_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_types::ToolInputSchema;
     use pretty_assertions::assert_eq;
 
-    fn make_tool(name: &str) -> McpTool {
-        McpTool {
-            annotations: None,
-            description: None,
-            input_schema: ToolInputSchema {
-                properties: None,
-                required: None,
-                r#type: "object".to_string(),
-            },
+    fn make_tool(name: &str) -> Tool {
+        Tool {
             name: name.to_string(),
-            output_schema: None,
             title: None,
+            description: None,
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
         }
     }
 
@@ -298,5 +417,129 @@ mod tests {
         expected.insert("beta".to_string(), expected_beta);
 
         assert_eq!(group_tools_by_server(&tools), expected);
+    }
+
+    #[test]
+    fn codex_apps_mcp_url_for_default_gateway_keeps_existing_paths() {
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "https://chatgpt.com/backend-api",
+                CodexAppsMcpGateway::LegacyMCPGateway
+            ),
+            "https://chatgpt.com/backend-api/wham/apps"
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "https://chat.openai.com",
+                CodexAppsMcpGateway::LegacyMCPGateway
+            ),
+            "https://chat.openai.com/backend-api/wham/apps"
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "http://localhost:8080/api/codex",
+                CodexAppsMcpGateway::LegacyMCPGateway
+            ),
+            "http://localhost:8080/api/codex/apps"
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "http://localhost:8080",
+                CodexAppsMcpGateway::LegacyMCPGateway
+            ),
+            "http://localhost:8080/api/codex/apps"
+        );
+    }
+
+    #[test]
+    fn codex_apps_mcp_url_for_gateway_uses_openai_connectors_gateway() {
+        let expected_url = format!("{OPENAI_CONNECTORS_MCP_BASE_URL}{OPENAI_CONNECTORS_MCP_PATH}");
+
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "https://chatgpt.com/backend-api",
+                CodexAppsMcpGateway::MCPGateway
+            ),
+            expected_url.as_str()
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "https://chat.openai.com",
+                CodexAppsMcpGateway::MCPGateway
+            ),
+            expected_url.as_str()
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "http://localhost:8080/api/codex",
+                CodexAppsMcpGateway::MCPGateway
+            ),
+            expected_url.as_str()
+        );
+        assert_eq!(
+            codex_apps_mcp_url_for_gateway(
+                "http://localhost:8080",
+                CodexAppsMcpGateway::MCPGateway
+            ),
+            expected_url.as_str()
+        );
+    }
+
+    #[test]
+    fn codex_apps_mcp_url_uses_default_gateway_when_feature_is_disabled() {
+        let mut config = crate::config::test_config();
+        config.chatgpt_base_url = "https://chatgpt.com".to_string();
+
+        assert_eq!(
+            codex_apps_mcp_url(&config),
+            "https://chatgpt.com/backend-api/wham/apps"
+        );
+    }
+
+    #[test]
+    fn codex_apps_mcp_url_uses_openai_connectors_gateway_when_feature_is_enabled() {
+        let mut config = crate::config::test_config();
+        config.chatgpt_base_url = "https://chatgpt.com".to_string();
+        config.features.enable(Feature::AppsMcpGateway);
+
+        assert_eq!(
+            codex_apps_mcp_url(&config),
+            format!("{OPENAI_CONNECTORS_MCP_BASE_URL}{OPENAI_CONNECTORS_MCP_PATH}")
+        );
+    }
+
+    #[test]
+    fn codex_apps_server_config_switches_gateway_with_flags() {
+        let mut config = crate::config::test_config();
+        config.chatgpt_base_url = "https://chatgpt.com".to_string();
+
+        let mut servers = with_codex_apps_mcp(HashMap::new(), false, None, &config);
+        assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
+
+        config.features.enable(Feature::Apps);
+
+        servers = with_codex_apps_mcp(servers, true, None, &config);
+        let server = servers
+            .get(CODEX_APPS_MCP_SERVER_NAME)
+            .expect("codex apps should be present when apps is enabled");
+        let url = match &server.transport {
+            McpServerTransportConfig::StreamableHttp { url, .. } => url,
+            _ => panic!("expected streamable http transport for codex apps"),
+        };
+
+        assert_eq!(url, "https://chatgpt.com/backend-api/wham/apps");
+
+        config.features.enable(Feature::AppsMcpGateway);
+        servers = with_codex_apps_mcp(servers, true, None, &config);
+        let server = servers
+            .get(CODEX_APPS_MCP_SERVER_NAME)
+            .expect("codex apps should remain present when apps stays enabled");
+        let url = match &server.transport {
+            McpServerTransportConfig::StreamableHttp { url, .. } => url,
+            _ => panic!("expected streamable http transport for codex apps"),
+        };
+
+        let expected_url = format!("{OPENAI_CONNECTORS_MCP_BASE_URL}{OPENAI_CONNECTORS_MCP_PATH}");
+        assert_eq!(url, &expected_url);
     }
 }

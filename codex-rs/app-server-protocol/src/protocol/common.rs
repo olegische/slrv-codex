@@ -41,6 +41,42 @@ pub enum AuthMode {
     ChatgptAuthTokens,
 }
 
+macro_rules! experimental_reason_expr {
+    // If a request variant is explicitly marked experimental, that reason wins.
+    (#[experimental($reason:expr)] $params:ident $(, $inspect_params:tt)?) => {
+        Some($reason)
+    };
+    // `inspect_params: true` is used when a method is mostly stable but needs
+    // field-level gating from its params type (for example, ThreadStart).
+    ($params:ident, true) => {
+        crate::experimental_api::ExperimentalApi::experimental_reason($params)
+    };
+    ($params:ident $(, $inspect_params:tt)?) => {
+        None
+    };
+}
+
+macro_rules! experimental_method_entry {
+    (#[experimental($reason:expr)] => $wire:literal) => {
+        $wire
+    };
+    (#[experimental($reason:expr)]) => {
+        $reason
+    };
+    ($($tt:tt)*) => {
+        ""
+    };
+}
+
+macro_rules! experimental_type_entry {
+    (#[experimental($reason:expr)] $ty:ty) => {
+        stringify!($ty)
+    };
+    ($ty:ty) => {
+        ""
+    };
+}
+
 /// Generates an `enum ClientRequest` where each variant is a request that the
 /// client can send to the server. Each variant has associated `params` and
 /// `response` types. Also generates a `export_client_responses()` function to
@@ -48,9 +84,11 @@ pub enum AuthMode {
 macro_rules! client_request_definitions {
     (
         $(
-            $(#[$variant_meta:meta])*
+            $(#[experimental($reason:expr)])?
+            $(#[doc = $variant_doc:literal])*
             $variant:ident $(=> $wire:literal)? {
                 params: $(#[$params_meta:meta])* $params:ty,
+                $(inspect_params: $inspect_params:tt,)?
                 response: $response:ty,
             }
         ),* $(,)?
@@ -60,7 +98,7 @@ macro_rules! client_request_definitions {
         #[serde(tag = "method", rename_all = "camelCase")]
         pub enum ClientRequest {
             $(
-                $(#[$variant_meta])*
+                $(#[doc = $variant_doc])*
                 $(#[serde(rename = $wire)] #[ts(rename = $wire)])?
                 $variant {
                     #[serde(rename = "id")]
@@ -70,6 +108,38 @@ macro_rules! client_request_definitions {
                 },
             )*
         }
+
+        impl crate::experimental_api::ExperimentalApi for ClientRequest {
+            fn experimental_reason(&self) -> Option<&'static str> {
+                match self {
+                    $(
+                        Self::$variant { params: _params, .. } => {
+                            experimental_reason_expr!(
+                                $(#[experimental($reason)])?
+                                _params
+                                $(, $inspect_params)?
+                            )
+                        }
+                    )*
+                }
+            }
+        }
+
+        pub(crate) const EXPERIMENTAL_CLIENT_METHODS: &[&str] = &[
+            $(
+                experimental_method_entry!($(#[experimental($reason)])? $(=> $wire)?),
+            )*
+        ];
+        pub(crate) const EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES: &[&str] = &[
+            $(
+                experimental_type_entry!($(#[experimental($reason)])? $params),
+            )*
+        ];
+        pub(crate) const EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES: &[&str] = &[
+            $(
+                experimental_type_entry!($(#[experimental($reason)])? $response),
+            )*
+        ];
 
         pub fn export_client_responses(
             out_dir: &::std::path::Path,
@@ -112,16 +182,20 @@ client_request_definitions! {
 
     /// NEW APIs
     // Thread lifecycle
+    // Uses `inspect_params` because only some fields are experimental.
     ThreadStart => "thread/start" {
         params: v2::ThreadStartParams,
+        inspect_params: true,
         response: v2::ThreadStartResponse,
     },
     ThreadResume => "thread/resume" {
         params: v2::ThreadResumeParams,
+        inspect_params: true,
         response: v2::ThreadResumeResponse,
     },
     ThreadFork => "thread/fork" {
         params: v2::ThreadForkParams,
+        inspect_params: true,
         response: v2::ThreadForkResponse,
     },
     ThreadArchive => "thread/archive" {
@@ -135,6 +209,15 @@ client_request_definitions! {
     ThreadUnarchive => "thread/unarchive" {
         params: v2::ThreadUnarchiveParams,
         response: v2::ThreadUnarchiveResponse,
+    },
+    ThreadCompactStart => "thread/compact/start" {
+        params: v2::ThreadCompactStartParams,
+        response: v2::ThreadCompactStartResponse,
+    },
+    #[experimental("thread/backgroundTerminals/clean")]
+    ThreadBackgroundTerminalsClean => "thread/backgroundTerminals/clean" {
+        params: v2::ThreadBackgroundTerminalsCleanParams,
+        response: v2::ThreadBackgroundTerminalsCleanResponse,
     },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
@@ -156,6 +239,14 @@ client_request_definitions! {
         params: v2::SkillsListParams,
         response: v2::SkillsListResponse,
     },
+    SkillsRemoteRead => "skills/remote/read" {
+        params: v2::SkillsRemoteReadParams,
+        response: v2::SkillsRemoteReadResponse,
+    },
+    SkillsRemoteWrite => "skills/remote/write" {
+        params: v2::SkillsRemoteWriteParams,
+        response: v2::SkillsRemoteWriteResponse,
+    },
     AppsList => "app/list" {
         params: v2::AppsListParams,
         response: v2::AppsListResponse,
@@ -166,7 +257,12 @@ client_request_definitions! {
     },
     TurnStart => "turn/start" {
         params: v2::TurnStartParams,
+        inspect_params: true,
         response: v2::TurnStartResponse,
+    },
+    TurnSteer => "turn/steer" {
+        params: v2::TurnSteerParams,
+        response: v2::TurnSteerResponse,
     },
     TurnInterrupt => "turn/interrupt" {
         params: v2::TurnInterruptParams,
@@ -181,10 +277,21 @@ client_request_definitions! {
         params: v2::ModelListParams,
         response: v2::ModelListResponse,
     },
-    /// EXPERIMENTAL - list collaboration mode presets.
+    ExperimentalFeatureList => "experimentalFeature/list" {
+        params: v2::ExperimentalFeatureListParams,
+        response: v2::ExperimentalFeatureListResponse,
+    },
+    #[experimental("collaborationMode/list")]
+    /// Lists collaboration mode presets.
     CollaborationModeList => "collaborationMode/list" {
         params: v2::CollaborationModeListParams,
         response: v2::CollaborationModeListResponse,
+    },
+    #[experimental("mock/experimentalMethod")]
+    /// Test-only method used to validate experimental gating.
+    MockExperimentalMethod => "mock/experimentalMethod" {
+        params: v2::MockExperimentalMethodParams,
+        response: v2::MockExperimentalMethodResponse,
     },
 
     McpServerOauthLogin => "mcpServer/oauth/login" {
@@ -204,6 +311,7 @@ client_request_definitions! {
 
     LoginAccount => "account/login/start" {
         params: v2::LoginAccountParams,
+        inspect_params: true,
         response: v2::LoginAccountResponse,
     },
 
@@ -349,6 +457,21 @@ client_request_definitions! {
     FuzzyFileSearch {
         params: FuzzyFileSearchParams,
         response: FuzzyFileSearchResponse,
+    },
+    #[experimental("fuzzyFileSearch/sessionStart")]
+    FuzzyFileSearchSessionStart => "fuzzyFileSearch/sessionStart" {
+        params: FuzzyFileSearchSessionStartParams,
+        response: FuzzyFileSearchSessionStartResponse,
+    },
+    #[experimental("fuzzyFileSearch/sessionUpdate")]
+    FuzzyFileSearchSessionUpdate => "fuzzyFileSearch/sessionUpdate" {
+        params: FuzzyFileSearchSessionUpdateParams,
+        response: FuzzyFileSearchSessionUpdateResponse,
+    },
+    #[experimental("fuzzyFileSearch/sessionStop")]
+    FuzzyFileSearchSessionStop => "fuzzyFileSearch/sessionStop" {
+        params: FuzzyFileSearchSessionStopParams,
+        response: FuzzyFileSearchSessionStopResponse,
     },
     /// Execute a command (argv vector) under the server's sandbox.
     ExecOneOffCommand {
@@ -594,6 +717,54 @@ pub struct FuzzyFileSearchResponse {
     pub files: Vec<FuzzyFileSearchResult>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FuzzyFileSearchSessionStartParams {
+    pub session_id: String,
+    pub roots: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
+pub struct FuzzyFileSearchSessionStartResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FuzzyFileSearchSessionUpdateParams {
+    pub session_id: String,
+    pub query: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
+pub struct FuzzyFileSearchSessionUpdateResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FuzzyFileSearchSessionStopParams {
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
+pub struct FuzzyFileSearchSessionStopResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FuzzyFileSearchSessionUpdatedNotification {
+    pub session_id: String,
+    pub query: String,
+    pub files: Vec<FuzzyFileSearchResult>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FuzzyFileSearchSessionCompletedNotification {
+    pub session_id: String,
+}
+
 server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
@@ -618,6 +789,7 @@ server_notification_definitions! {
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+    AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     ReasoningSummaryTextDelta => "item/reasoning/summaryTextDelta" (v2::ReasoningSummaryTextDeltaNotification),
     ReasoningSummaryPartAdded => "item/reasoning/summaryPartAdded" (v2::ReasoningSummaryPartAddedNotification),
     ReasoningTextDelta => "item/reasoning/textDelta" (v2::ReasoningTextDeltaNotification),
@@ -625,6 +797,8 @@ server_notification_definitions! {
     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
     DeprecationNotice => "deprecationNotice" (v2::DeprecationNoticeNotification),
     ConfigWarning => "configWarning" (v2::ConfigWarningNotification),
+    FuzzyFileSearchSessionUpdated => "fuzzyFileSearch/sessionUpdated" (FuzzyFileSearchSessionUpdatedNotification),
+    FuzzyFileSearchSessionCompleted => "fuzzyFileSearch/sessionCompleted" (FuzzyFileSearchSessionCompletedNotification),
 
     /// Notifies the user of world-writable directories on Windows, which cannot be protected by the sandbox.
     WindowsWorldWritableWarning => "windows/worldWritableWarning" (v2::WindowsWorldWritableWarningNotification),
@@ -693,6 +867,94 @@ mod tests {
                 }
             }),
             serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_initialize_with_opt_out_notification_methods() -> Result<()> {
+        let request = ClientRequest::Initialize {
+            request_id: RequestId::Integer(42),
+            params: v1::InitializeParams {
+                client_info: v1::ClientInfo {
+                    name: "codex_vscode".to_string(),
+                    title: Some("Codex VS Code Extension".to_string()),
+                    version: "0.1.0".to_string(),
+                },
+                capabilities: Some(v1::InitializeCapabilities {
+                    experimental_api: true,
+                    opt_out_notification_methods: Some(vec![
+                        "codex/event/session_configured".to_string(),
+                        "item/agentMessage/delta".to_string(),
+                    ]),
+                }),
+            },
+        };
+
+        assert_eq!(
+            json!({
+                "method": "initialize",
+                "id": 42,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_vscode",
+                        "title": "Codex VS Code Extension",
+                        "version": "0.1.0"
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
+                        "optOutNotificationMethods": [
+                            "codex/event/session_configured",
+                            "item/agentMessage/delta"
+                        ]
+                    }
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_initialize_with_opt_out_notification_methods() -> Result<()> {
+        let request: ClientRequest = serde_json::from_value(json!({
+            "method": "initialize",
+            "id": 42,
+            "params": {
+                "clientInfo": {
+                    "name": "codex_vscode",
+                    "title": "Codex VS Code Extension",
+                    "version": "0.1.0"
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "optOutNotificationMethods": [
+                        "codex/event/session_configured",
+                        "item/agentMessage/delta"
+                    ]
+                }
+            }
+        }))?;
+
+        assert_eq!(
+            request,
+            ClientRequest::Initialize {
+                request_id: RequestId::Integer(42),
+                params: v1::InitializeParams {
+                    client_info: v1::ClientInfo {
+                        name: "codex_vscode".to_string(),
+                        title: Some("Codex VS Code Extension".to_string()),
+                        version: "0.1.0".to_string(),
+                    },
+                    capabilities: Some(v1::InitializeCapabilities {
+                        experimental_api: true,
+                        opt_out_notification_methods: Some(vec![
+                            "codex/event/session_configured".to_string(),
+                            "item/agentMessage/delta".to_string(),
+                        ]),
+                    }),
+                },
+            }
         );
         Ok(())
     }
@@ -894,7 +1156,8 @@ mod tests {
             request_id: RequestId::Integer(5),
             params: v2::LoginAccountParams::ChatgptAuthTokens {
                 access_token: "access-token".to_string(),
-                id_token: "id-token".to_string(),
+                chatgpt_account_id: "org-123".to_string(),
+                chatgpt_plan_type: Some("business".to_string()),
             },
         };
         assert_eq!(
@@ -904,7 +1167,8 @@ mod tests {
                 "params": {
                     "type": "chatgptAuthTokens",
                     "accessToken": "access-token",
-                    "idToken": "id-token"
+                    "chatgptAccountId": "org-123",
+                    "chatgptPlanType": "business"
                 }
             }),
             serde_json::to_value(&request)?,
@@ -971,7 +1235,8 @@ mod tests {
                 "id": 6,
                 "params": {
                     "limit": null,
-                    "cursor": null
+                    "cursor": null,
+                    "includeHidden": null
                 }
             }),
             serde_json::to_value(&request)?,
@@ -994,5 +1259,77 @@ mod tests {
             serde_json::to_value(&request)?,
         );
         Ok(())
+    }
+
+    #[test]
+    fn serialize_list_apps() -> Result<()> {
+        let request = ClientRequest::AppsList {
+            request_id: RequestId::Integer(8),
+            params: v2::AppsListParams::default(),
+        };
+        assert_eq!(
+            json!({
+                "method": "app/list",
+                "id": 8,
+                "params": {
+                    "cursor": null,
+                    "limit": null,
+                    "threadId": null
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_list_experimental_features() -> Result<()> {
+        let request = ClientRequest::ExperimentalFeatureList {
+            request_id: RequestId::Integer(8),
+            params: v2::ExperimentalFeatureListParams::default(),
+        };
+        assert_eq!(
+            json!({
+                "method": "experimentalFeature/list",
+                "id": 8,
+                "params": {
+                    "cursor": null,
+                    "limit": null
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_thread_background_terminals_clean() -> Result<()> {
+        let request = ClientRequest::ThreadBackgroundTerminalsClean {
+            request_id: RequestId::Integer(8),
+            params: v2::ThreadBackgroundTerminalsCleanParams {
+                thread_id: "thr_123".to_string(),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "thread/backgroundTerminals/clean",
+                "id": 8,
+                "params": {
+                    "threadId": "thr_123"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mock_experimental_method_is_marked_experimental() {
+        let request = ClientRequest::MockExperimentalMethod {
+            request_id: RequestId::Integer(1),
+            params: v2::MockExperimentalMethodParams::default(),
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("mock/experimentalMethod"));
     }
 }

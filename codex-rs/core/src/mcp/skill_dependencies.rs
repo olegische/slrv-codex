@@ -144,7 +144,7 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
-    let config = turn_context.client.config();
+    let config = turn_context.config.clone();
     if mentioned_skills.is_empty() || !config.features.enabled(Feature::SkillMcpDependencyInstall) {
         return;
     }
@@ -379,6 +379,7 @@ fn mcp_dependency_to_server_config(
                 env_http_headers: None,
             },
             enabled: true,
+            required: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -402,6 +403,7 @@ fn mcp_dependency_to_server_config(
                 cwd: None,
             },
             enabled: true,
+            required: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -429,6 +431,8 @@ mod tests {
             short_description: None,
             interface: None,
             dependencies: Some(SkillDependencies { tools }),
+            policy: None,
+            permissions: None,
             path: PathBuf::from("skill"),
             scope: SkillScope::User,
         }
@@ -455,6 +459,7 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
@@ -502,6 +507,7 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                required: false,
                 disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,

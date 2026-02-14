@@ -1,5 +1,3 @@
-use codex_common::elapsed::format_duration;
-use codex_common::elapsed::format_elapsed;
 use codex_core::config::Config;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningRawContentEvent;
@@ -36,6 +34,8 @@ use codex_core::protocol::WebSearchEndEvent;
 use codex_core::web_search::web_search_detail;
 use codex_protocol::items::TurnItem;
 use codex_protocol::num_format::format_with_separators;
+use codex_utils_elapsed::format_duration;
+use codex_utils_elapsed::format_elapsed;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
 use shlex::try_join;
@@ -46,9 +46,9 @@ use std::time::Instant;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
-use codex_common::create_config_summary_entries;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_utils_sandbox_summary::create_config_summary_entries;
 
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
@@ -264,7 +264,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     "auto-cancelling (not supported in exec mode)".style(self.dimmed)
                 );
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message, ..
+            }) => {
                 let last_message = last_agent_message
                     .as_deref()
                     .or(self.last_proposed_plan.as_deref());
@@ -375,7 +377,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 ts_msg!(self, "{}", title.style(title_style));
 
                 if let Ok(res) = result {
-                    let val: serde_json::Value = res.into();
+                    let val = serde_json::to_value(res)
+                        .unwrap_or_else(|_| serde_json::Value::String("<result>".to_string()));
                     let pretty =
                         serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
 
@@ -592,17 +595,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     view.path.display()
                 );
             }
-            EventMsg::TurnAborted(abort_reason) => match abort_reason.reason {
-                TurnAbortReason::Interrupted => {
-                    ts_msg!(self, "task interrupted");
+            EventMsg::TurnAborted(abort_reason) => {
+                match abort_reason.reason {
+                    TurnAbortReason::Interrupted => {
+                        ts_msg!(self, "task interrupted");
+                    }
+                    TurnAbortReason::Replaced => {
+                        ts_msg!(self, "task aborted: replaced by a new task");
+                    }
+                    TurnAbortReason::ReviewEnded => {
+                        ts_msg!(self, "task aborted: review ended");
+                    }
                 }
-                TurnAbortReason::Replaced => {
-                    ts_msg!(self, "task aborted: replaced by a new task");
-                }
-                TurnAbortReason::ReviewEnded => {
-                    ts_msg!(self, "task aborted: review ended");
-                }
-            },
+                return CodexStatus::InitiateShutdown;
+            }
             EventMsg::ContextCompacted(_) => {
                 ts_msg!(self, "context compacted");
             }
@@ -772,6 +778,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::McpListToolsResponse(_)
             | EventMsg::ListCustomPromptsResponse(_)
             | EventMsg::ListSkillsResponse(_)
+            | EventMsg::ListRemoteSkillsResponse(_)
+            | EventMsg::RemoteSkillDownloaded(_)
             | EventMsg::RawResponseItem(_)
             | EventMsg::UserMessage(_)
             | EventMsg::EnteredReviewMode(_)
@@ -790,6 +798,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::UndoStarted(_)
             | EventMsg::ThreadRolledBack(_)
             | EventMsg::RequestUserInput(_)
+            | EventMsg::CollabResumeBegin(_)
+            | EventMsg::CollabResumeEnd(_)
             | EventMsg::DynamicToolCallRequest(_) => {}
         }
         CodexStatus::Running
