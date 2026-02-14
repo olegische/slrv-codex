@@ -23,3 +23,7 @@ make -j"$(nproc)"
 ## Release workflow
 
 `.github/workflows/shell-tool-mcp.yml` builds the Rust binaries, compiles the patched Bash variants, assembles the `vendor/` tree, and creates `codex-shell-tool-mcp-npm-<version>.tgz` for inclusion in the Rust GitHub Release. When the version is a stable or alpha tag, the workflow also publishes the tarball to npm using OIDC. The workflow is invoked from `rust-release.yml` so the package ships alongside other Codex artifacts.
+
+## Trademark Notice
+
+`Codex` and `OpenAI` are trademarks of OpenAI. This crate is part of an independent fork and is not affiliated with, endorsed by, or sponsored by OpenAI.

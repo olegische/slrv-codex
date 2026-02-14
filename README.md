@@ -18,9 +18,8 @@ Install from the GitHub Releases in this repository:
 ```shell
 # 1) Download the release asset for your platform from:
 #    https://github.com/olegische/slrv-codex/releases/latest
-# 2) Extract, then rename to avoid clobbering the upstream codex binary.
-tar -xzf codex-<target>.tar.gz
-mv codex-<target> slrv-codex
+# 2) Extract the SLRV binary.
+tar -xzf slrv-codex-<target>.tar.gz
 chmod +x slrv-codex
 ```
 
@@ -32,13 +31,13 @@ Then run `slrv-codex` to get started.
 Each GitHub Release contains many executables, but in practice, you likely want one of these:
 
 - macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
+  - Apple Silicon/arm64: `slrv-codex-aarch64-apple-darwin.tar.gz`
+  - x86_64 (older Mac hardware): `slrv-codex-x86_64-apple-darwin.tar.gz`
 - Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+  - x86_64: `slrv-codex-x86_64-unknown-linux-musl.tar.gz`
+  - arm64: `slrv-codex-aarch64-unknown-linux-musl.tar.gz`
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`). Since we did not rename the application, we recommend renaming the extracted file to `slrv-codex` to avoid clobbering the official `codex` binary.
+Each archive contains a single entry with the platform baked into the name (e.g., `slrv-codex-x86_64-unknown-linux-musl`). Rename that extracted file to `slrv-codex` if you prefer a shorter command name.
 
 </details>
 
@@ -57,3 +56,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
+
+## Trademark Notice
+
+`Codex` and `OpenAI` are trademarks of OpenAI. This project is an independent research fork and is not affiliated with, endorsed by, or sponsored by OpenAI. Use of these names is nominative and for compatibility/reference purposes only.
