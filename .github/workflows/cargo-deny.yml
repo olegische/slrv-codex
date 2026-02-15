@@ -2,9 +2,15 @@ name: cargo-deny
 
 on:
   pull_request:
+    branches:
+      - slrv
+      - "release/*"
+      - "release/**"
   push:
     branches:
-      - main
+      - slrv
+      - "release/*"
+      - "release/**"
 
 jobs:
   cargo-deny:
