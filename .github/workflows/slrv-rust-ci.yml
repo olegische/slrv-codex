@@ -26,12 +26,25 @@ jobs:
       # See https://github.com/openai/codex/pull/7617.
       - name: Install DotSlash
         uses: facebook/install-dotslash@v2
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
       - uses: dtolnay/rust-toolchain@1.93
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2
+        with:
+          tool: nextest
+          version: 0.9.103
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-features --tests -- -D warnings
-      - name: cargo test
-        run: cargo test --all-features
+      - name: cargo nextest
+        run: cargo nextest run --all-features --no-fail-fast --cargo-profile ci-test
+        env:
+          RUST_BACKTRACE: 1
+          NEXTEST_STATUS_LEVEL: leak
