@@ -4,8 +4,6 @@ on:
   pull_request:
     branches:
       - slrv
-      - "release/*"
-      - "release/**"
   push:
     branches:
       - slrv
@@ -35,16 +33,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93
         with:
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2
-        with:
-          tool: nextest
-          version: 0.9.103
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-features --tests -- -D warnings
-      - name: cargo nextest
-        run: cargo nextest run --all-features --no-fail-fast --cargo-profile ci-test
-        env:
-          RUST_BACKTRACE: 1
-          NEXTEST_STATUS_LEVEL: leak
+      - name: cargo test
+        run: cargo test --all-features
