@@ -119,10 +119,11 @@ async fn prompt_tools_are_consistent_across_requests_impl(
             config.model = Some("gpt-5.1-codex-max".to_string());
             config.slrv_enabled = slrv_enabled;
             // Keep tool expectations stable when the default web_search mode changes.
-            config
-                .web_search_mode
-                .set(WebSearchMode::Cached)
-                .expect("test web_search_mode should satisfy constraints");
+            let web_search_mode_set = config.web_search_mode.set(WebSearchMode::Cached);
+            assert!(
+                web_search_mode_set.is_ok(),
+                "test web_search_mode should satisfy constraints",
+            );
             config.features.enable(Feature::CollaborationModes);
         })
         .build(&server)
