@@ -39,6 +39,26 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
         .saturating_add(approx_token_count(&request.instructions_text()))
 }
 
+const SLRV_HEADER: &str = "# SLRV Framework (Agent-Level Declaration)";
+
+fn assert_instructions_match_with_optional_slrv(actual: &str, expected: &str, slrv_enabled: bool) {
+    if slrv_enabled {
+        // Runtime appends SLRV when enabled, so compare only the base prefix
+        // and assert the SLRV marker separately.
+        let stripped = actual
+            .split_once(SLRV_HEADER)
+            .map(|(before, _)| before.trim_end())
+            .unwrap_or(actual);
+        assert_eq!(stripped, expected);
+        assert!(
+            actual.contains(SLRV_HEADER),
+            "expected SLRV header to be present in instructions"
+        );
+    } else {
+        assert_eq!(actual, expected);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -741,10 +761,13 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
     })
     .await;
 
+    // With SLRV enabled, runtime may append SLRV text to instructions.
+    // Compare the requested override base while tolerating the optional SLRV suffix.
     let override_compact_request = override_compact_mock.single_request();
-    assert_eq!(
-        override_compact_request.instructions_text(),
-        override_base_instructions
+    assert_instructions_match_with_optional_slrv(
+        &override_compact_request.instructions_text(),
+        &override_base_instructions,
+        override_harness.test().config.slrv_enabled,
     );
     assert!(
         override_compact_request.has_function_call(override_retained_call_id),
